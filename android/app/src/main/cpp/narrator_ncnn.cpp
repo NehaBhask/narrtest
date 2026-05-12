@@ -129,17 +129,20 @@ static bool      modelLoaded    = false;
 static const int INPUT_SIZE     = 320;
 
 // ── Tuned thresholds ──────────────────────────────────────────────────────────
-// CONF_THRESHOLD 0.50: per-anchor minimum score. Keeping at 0.50 because the
-//   real fix is correct box normalisation (÷INPUT_SIZE) and output-layout
-//   detection, not just raising the score bar.
+// CONF_THRESHOLD 0.65: raised from 0.50 — eliminates the vast majority of
+//   ghost/false-positive detections that were naming random objects. At 0.65
+//   the model only fires when it is genuinely confident.
+// MIN_BOX_AREA 0.03: skip any box smaller than 3% of frame — these are too
+//   tiny to be meaningful obstacles and are nearly always noise.
 // NMS_THRESHOLD 0.30: aggressive same-class merge — kills duplicate boxes.
 // CROSS_CLASS_NMS_IOU 0.50: if two boxes of DIFFERENT classes overlap >50%
-//   keep only the higher-confidence one. Eliminates truck/bicycle on same region.
-// MAX_DETECTIONS 6: hard cap so the UI never floods even in edge cases.
-static const float CONF_THRESHOLD       = 0.50f;  // minimum per-anchor class score
+//   keep only the higher-confidence one.
+// MAX_DETECTIONS 5: hard cap so the UI never floods even in edge cases.
+static const float CONF_THRESHOLD       = 0.65f;  // raised — kills most false positives
+static const float MIN_BOX_AREA         = 0.03f;  // normalised area floor (3% of frame)
 static const float NMS_THRESHOLD        = 0.30f;  // same-class IoU merge threshold
 static const float CROSS_CLASS_NMS_IOU  = 0.50f;  // cross-class suppression IoU
-static const int   MAX_DETECTIONS       = 6;      // hard cap on final output boxes
+static const int   MAX_DETECTIONS       = 5;      // hard cap on final output boxes
 
 // ── JNI: nativeLoadModel ─────────────────────────────────────────────────────
 extern "C" JNIEXPORT jboolean JNICALL
@@ -296,7 +299,9 @@ static std::vector<Detection> runInference(
 
         if (maxConf < CONF_THRESHOLD)     continue;
         if (bestCls < 0 || bestCls >= 80) continue;
-        if (!IS_OBSTACLE[bestCls])        continue;
+        // NOTE: IS_OBSTACLE filter removed here — we return ALL reliable detections
+        // and let the Flutter ObstacleDetector decide which ones are in-path threats.
+        // This way the UI still shows non-obstacle detections with correct labels.
 
         // YOLOv8 NCNN exports box coords in INPUT_SIZE pixel space (0–320).
         // Normalise to [0,1] by dividing by INPUT_SIZE.
@@ -306,8 +311,10 @@ static std::vector<Detection> runInference(
         float x2 = std::max(0.f, std::min(1.f, (cx + bw * 0.5f) * scale));
         float y2 = std::max(0.f, std::min(1.f, (cy + bh * 0.5f) * scale));
 
-        // Skip degenerate or near-zero boxes
+        // Skip degenerate boxes and boxes smaller than the area floor
         if ((x2 - x1) < 0.02f || (y2 - y1) < 0.02f) continue;
+        const float area = (x2 - x1) * (y2 - y1);
+        if (area < MIN_BOX_AREA) continue;
 
         candidates.push_back({bestCls, maxConf, x1, y1, x2, y2});
     }
@@ -362,6 +369,21 @@ Java_com_narrator_NarratorPlugin_nativeDetectObjects(
     env->ReleaseByteArrayElements(yuvData, yuv, JNI_ABORT);
 
     auto result = runInference(rgb.data(), width, height);
+    return packDetections(env, result);
+}
+
+// ── JNI: nativeDetectFromRgb (Direct RGB from Kotlin Bitmap) ──────────────────
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_com_narrator_NarratorPlugin_nativeDetectFromRgb(
+    JNIEnv *env, jobject /*thiz*/,
+    jbyteArray rgbData, jint width, jint height) {
+
+    if (!modelLoaded) { LOGE("Model not loaded"); return env->NewFloatArray(0); }
+
+    jbyte *rgb = env->GetByteArrayElements(rgbData, nullptr);
+    auto result = runInference(reinterpret_cast<const unsigned char*>(rgb), width, height);
+    env->ReleaseByteArrayElements(rgbData, rgb, JNI_ABORT);
+
     return packDetections(env, result);
 }
 

@@ -9,31 +9,38 @@ class TtsService {
   final FlutterTts _tts = FlutterTts();
   final _log = Logger();
   bool _isSpeaking = false;
-  bool _stopped = false;
+  bool _stopCalled = false;   // guards against completion firing after manual stop()
   String _currentLanguageCode = 'en';
+  String _lastAlertText = '';  // dedup guard — don’t re-queue the exact same alert
 
-  final List<_TtsRequest> _queue = [];
+  // Separate queues so alerts never get mixed with response sentences
+  final List<String> _alertQueue    = [];
+  final List<String> _responseQueue = [];
 
   Future<void> init() async {
     await _tts.setSharedInstance(true);
+    await _tts.awaitSpeakCompletion(true);  // makes speak() properly async
     await _tts.setSpeechRate(0.50);
     await _tts.setVolume(1.0);
     await _tts.setPitch(1.0);
 
     _tts.setStartHandler(() {
       _isSpeaking = true;
-      _stopped = false;
+      _stopCalled = false;
     });
 
     _tts.setCompletionHandler(() {
       _isSpeaking = false;
-      if (!_stopped) _processQueue();
+      // Only advance the queue if we didn’t call stop() ourselves.
+      // When stop() is called, _stopCalled is set true and the queue is
+      // cleared — so there is nothing to process anyway.
+      if (!_stopCalled) _processNext();
     });
 
     _tts.setErrorHandler((msg) {
       _log.e('TTS error: $msg');
       _isSpeaking = false;
-      if (!_stopped) _processQueue();
+      if (!_stopCalled) _processNext();
     });
 
     _tts.setCancelHandler(() {
@@ -45,55 +52,85 @@ class TtsService {
     _currentLanguageCode = langCode;
     final locale = AppConstants.supportedLanguages
         .firstWhere((l) => l['code'] == langCode,
-            orElse: () => {'locale': 'en-US'})['locale']!;
+            orElse: () => {'locale': 'en-IN'})['locale']!;
     _tts.setLanguage(locale);
   }
 
-  /// P1 alert — interrupts everything immediately.
+  /// P1 obstacle alert — immediately interrupts everything.
   Future<void> speakAlert(String? text) async {
-    final msg = text ??
-        AppConstants.obstacleAlertMessages[_currentLanguageCode] ??
-        'Obstacle ahead';
-    _queue.removeWhere((r) => !r.isAlert);
-    _queue.insert(0, _TtsRequest(text: msg, isAlert: true));
-    if (_isSpeaking) await _tts.stop();
-    _stopped = false;
-    _processQueue();
-  }
+    final msg = (text != null && text.trim().isNotEmpty)
+        ? text
+        : AppConstants.obstacleAlertMessages[_currentLanguageCode] ?? 'Obstacle ahead';
 
-  /// Speak a single complete response — clears any pending queue first
-  /// so we never repeat or stack old responses.
-  Future<void> speakResponse(String text) async {
-    if (text.trim().isEmpty) return;
-    _stopped = false;
-    _queue.clear(); // clear any stale items before adding new response
-    _queue.add(_TtsRequest(text: text, isAlert: false));
+    // Dedup: if we are already playing this exact alert, don’t restart it.
+    if (_isSpeaking && msg == _lastAlertText) return;
+
+    // Discard any pending response sentences — alert takes priority
+    _responseQueue.clear();
+    _alertQueue.clear();
+    _alertQueue.add(msg);
+    _lastAlertText = msg;
+
     if (_isSpeaking) {
+      _stopCalled = true;
+      _isSpeaking = false;
       await _tts.stop();
     }
-    _processQueue();
+    _processNext();
   }
 
-  void _processQueue() {
-    if (_queue.isEmpty || _isSpeaking || _stopped) return;
-    final next = _queue.removeAt(0);
-    _isSpeaking = true;
-    _tts.speak(next.text);
+  /// Queue one response sentence (called per-sentence by StreamingTts).
+  /// Does NOT clear existing queue — sentences accumulate and play in order.
+  Future<void> speakSentence(String text) async {
+    if (text.trim().isEmpty) return;
+    _responseQueue.add(text);
+    // Only kick off playback if nothing is playing right now
+    if (!_isSpeaking) _processNext();
   }
 
-  /// Stop speaking and clear all pending speech.
+  /// Speak a complete pre-built response (non-streaming fallback).
+  Future<void> speakResponse(String text) async {
+    if (text.trim().isEmpty) return;
+    _responseQueue.clear();
+    _responseQueue.add(text);
+    if (_isSpeaking) {
+      _stopCalled = true;
+      _isSpeaking = false;
+      await _tts.stop();
+    }
+    _processNext();
+  }
+
+  void _processNext() {
+    if (_isSpeaking) return;
+    // Alerts have strict priority
+    if (_alertQueue.isNotEmpty) {
+      final text = _alertQueue.removeAt(0);
+      _isSpeaking = true;
+      _stopCalled = false;
+      _tts.speak(text);
+      return;
+    }
+    // Alert queue is now empty — clear the dedup guard so the same obstacle
+    // can be announced again after the SafetyCoordinator cooldown expires.
+    _lastAlertText = '';
+    if (_responseQueue.isNotEmpty) {
+      final text = _responseQueue.removeAt(0);
+      _isSpeaking = true;
+      _stopCalled = false;
+      _tts.speak(text);
+    }
+  }
+
+  /// Stop all speech and clear every queue.
   Future<void> stop() async {
-    _stopped = true;
-    _queue.clear();
+    _alertQueue.clear();
+    _responseQueue.clear();
+    _lastAlertText = '';
+    _stopCalled = true;
     _isSpeaking = false;
     await _tts.stop();
   }
 
   bool get isSpeaking => _isSpeaking;
-}
-
-class _TtsRequest {
-  final String text;
-  final bool isAlert;
-  _TtsRequest({required this.text, required this.isAlert});
 }

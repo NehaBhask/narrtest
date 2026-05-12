@@ -5,6 +5,7 @@ import 'package:logger/logger.dart';
 import 'yolo_ncnn_runner.dart';
 import 'obstacle_detector.dart';
 import '../pipeline2/frame_selector.dart';
+import '../pipeline2/conversation_coordinator.dart';
 import '../../services/haptic_service.dart';
 import '../../services/tts_service.dart';
 import '../../services/language_service.dart';
@@ -124,25 +125,58 @@ class SafetyCoordinator {
   }
 
   Future<void> _triggerAlert(YoloDetection threat) async {
+    // ── Guard 1: cooldown ───────────────────────────────────────────────
     final now = DateTime.now();
     if (_lastAlertTime != null &&
         now.difference(_lastAlertTime!).inMilliseconds <
             AppConstants.obstacleCooldownMs) {
       return;
     }
+
+    // ── Guard 2: never interrupt P2 speaking/thinking ───────────────────
+    // If the user has asked a question and the VLM is responding, let them
+    // hear the answer. P1 will resume alerting once P2 goes back to idle.
+    final p2State = ConversationCoordinator.instance.state;
+    if (p2State == Pipeline2State.speaking ||
+        p2State == Pipeline2State.thinking ||
+        p2State == Pipeline2State.transcribing ||
+        p2State == Pipeline2State.recording) {
+      _log.d('P1: suppressing alert — P2 is $p2State');
+      return;
+    }
+
     _lastAlertTime = now;
 
     final distance = _detector.estimateDistanceM(threat);
-    _log.i('🚨 Obstacle! class=${threat.classId}, '
+    _log.i('🚨 Obstacle! class=${threat.className}, '
         'conf=${threat.confidence.toStringAsFixed(2)}, '
-        'dist≈${distance.toStringAsFixed(1)}m');
+        'dist≈${distance.toStringAsFixed(1)}m, '
+        'area=${threat.area.toStringAsFixed(2)}, '
+        'cx=${threat.centerX.toStringAsFixed(2)}, '
+        'cy=${threat.centerY.toStringAsFixed(2)}');
 
-    // Fire haptic and TTS concurrently — no need to wait for vibration before speaking
-    final msg = LanguageService.instance.obstacleAlertText;
-    await Future.wait([
-      HapticService.instance.obstacleAlert(),
-      TtsService.instance.speakAlert(msg),
-    ]);
+    // Build a message that names the object so it’s more useful than just
+    // "obstacle ahead" — e.g. "person ahead" or "chair ahead".
+    final lang  = LanguageService.instance.currentCode;
+    final label = threat.className;   // already in English from COCO names
+    final msg   = _buildAlertMessage(lang, label);
+
+    // Fire haptic first (instant), then TTS (tiny delay acceptable)
+    await HapticService.instance.obstacleAlert();
+    await TtsService.instance.speakAlert(msg);
+  }
+
+  /// Build a localised alert string that names the detected object.
+  String _buildAlertMessage(String langCode, String objectName) {
+    switch (langCode) {
+      case 'hi': return 'आगे $objectName है, सावधान';
+      case 'ta': return 'முன்னால் $objectName உள்ளது';
+      case 'te': return 'ముందు $objectName ఉంది';
+      case 'bn': return 'সামনে $objectName আছে';
+      case 'mr': return 'पुढे $objectName आहे';
+      case 'kn': return 'ಮುಂದೆ $objectName ಇದೆ';
+      default:   return '$objectName ahead';
+    }
   }
 
   void pause() {

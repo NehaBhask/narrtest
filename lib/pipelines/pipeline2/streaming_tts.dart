@@ -55,7 +55,9 @@ class StreamingTts {
   void _speakSentence(String sentence) {
     _sentenceCount++;
     _log.d('TTS[$_sentenceCount]: "${sentence.substring(0, sentence.length.clamp(0, 50))}"');
-    TtsService.instance.speakResponse(sentence);
+    // Use speakSentence (not speakResponse) so the queue is NOT cleared
+    // between sentences — each sentence is appended and plays in order.
+    TtsService.instance.speakSentence(sentence);
   }
 
   Future<void> _onComplete() async {

@@ -5,24 +5,25 @@ import '../../core/model_manager.dart';
 import '../../core/constants.dart';
 import 'dart:io';
 
-// ── Full COCO-80 class names (must match narrator_ncnn.cpp order) ─────────────
-const List<String> cocoClassNames = [
-  'person',        'bicycle',       'car',           'motorcycle',    'airplane',
-  'bus',           'train',         'truck',         'boat',          'traffic light',
-  'fire hydrant',  'stop sign',     'parking meter', 'bench',         'bird',
-  'cat',           'dog',           'horse',         'sheep',         'cow',
-  'elephant',      'bear',          'zebra',         'giraffe',       'backpack',
-  'umbrella',      'handbag',       'tie',           'suitcase',      'frisbee',
-  'skis',          'snowboard',     'sports ball',   'kite',          'baseball bat',
-  'baseball glove','skateboard',    'surfboard',     'tennis racket', 'bottle',
-  'wine glass',    'cup',           'fork',          'knife',         'spoon',
-  'bowl',          'banana',        'apple',         'sandwich',      'orange',
-  'broccoli',      'carrot',        'hot dog',       'pizza',         'donut',
-  'cake',          'chair',         'couch',         'potted plant',  'bed',
-  'dining table',  'toilet',        'tv',            'laptop',        'mouse',
-  'remote',        'keyboard',      'cell phone',    'microwave',     'oven',
-  'toaster',       'sink',          'refrigerator',  'book',          'clock',
-  'vase',          'scissors',      'teddy bear',    'hair drier',    'toothbrush',
+// ── Assistive-Navigation class names ─────────────────────────────────────────
+// Order MUST match the label indices in the Roboflow-exported NCNN model.
+// Dataset: "Obstacle Detection for Assistive Navigation" (Roboflow Universe)
+// Classes (index 0–6):
+//   0 obstacle  — generic blocking object
+//   1 stairs    — step / staircase in path
+//   2 door      — door (open or closed)
+//   3 hazard    — wet floor, construction, etc.
+//   4 pole      — lamp-post, bollard, signpost
+//   5 person    — pedestrian / bystander
+//   6 vehicle   — car, bike, bus, auto-rickshaw
+const List<String> navClassNames = [
+  'obstacle',
+  'stairs',
+  'door',
+  'hazard',
+  'pole',
+  'person',
+  'vehicle',
 ];
 
 class YoloDetection {
@@ -39,10 +40,10 @@ class YoloDetection {
     required this.y2,
   });
 
-  /// Human-readable class name e.g. "person", "chair", "laptop"
+  /// Human-readable class name e.g. "person", "stairs", "vehicle"
   String get className =>
-      (classId >= 0 && classId < cocoClassNames.length)
-          ? cocoClassNames[classId]
+      (classId >= 0 && classId < navClassNames.length)
+          ? navClassNames[classId]
           : 'cls$classId';
 
   double get area    => (x2 - x1) * (y2 - y1);
@@ -101,7 +102,7 @@ class YoloNcnnRunner {
         'binPath':   binPath,
       });
       _isLoaded = result ?? false;
-      _log.i('YOLOv8 loaded: $_isLoaded');
+      _log.i('YOLOv8 nav-model loaded: $_isLoaded  (${navClassNames.length} classes)');
       return _isLoaded;
     } catch (e) {
       _log.e('Error loading YOLO model: $e');
@@ -141,8 +142,8 @@ class YoloNcnnRunner {
       final x2         = (raw[i + 4] as num).toDouble();
       final y2         = (raw[i + 5] as num).toDouble();
 
-      // Guard: skip any classId outside the COCO-80 range
-      if (classId < 0 || classId >= cocoClassNames.length) {
+      // Guard: skip any classId outside the nav-model range (0–6)
+      if (classId < 0 || classId >= navClassNames.length) {
         _log.w('_parseResult: skipping out-of-range classId=$classId (raw idx $i)');
         continue;
       }

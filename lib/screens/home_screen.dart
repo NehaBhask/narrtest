@@ -382,11 +382,12 @@ class _BboxPainter extends CustomPainter {
   final List<YoloDetection> detections;
   _BboxPainter(this.detections);
 
-  // Minimum normalised area a box must occupy to be drawn (filters edge ghosts)
-  static const double _minArea = 0.05;
+  // Only draw boxes that are at least 10% of frame area.
+  // Anything smaller is not visible enough to be useful on screen.
+  static const double _minArea = 0.10;
 
-  // Close-obstacle threshold — matches ObstacleDetector.areaThreshold
-  static const double _closeArea = 0.12;
+  // Never draw more than this many boxes regardless of detections.
+  static const int _maxBoxes = 4;
 
   // One stable color per COCO class (cycles through 6)
   static const _colors = [
@@ -399,12 +400,19 @@ class _BboxPainter extends CustomPainter {
     final boxPaint = Paint()..style = PaintingStyle.stroke..strokeWidth = 2.5;
     final bgPaint  = Paint()..style = PaintingStyle.fill;
 
-    for (final det in detections) {
-      // Skip tiny / degenerate boxes
-      if (det.area < _minArea) continue;
+    // detections are already sorted by confidence desc from _parseResult.
+    // Filter to drawable boxes first, then cap at _maxBoxes.
+    final drawable = detections
+        .where((d) => d.area >= _minArea)
+        .take(_maxBoxes)
+        .toList();
 
-      // Close obstacles glow red, everything else uses a class-stable color
-      final isClose = det.area >= _closeArea;
+    for (final det in drawable) {
+      // Close obstacles glow red — must match ObstacleDetector._isInPath logic
+      final isClose = det.area >= AppConstants.obstacleAreaThreshold &&
+          det.centerX >= AppConstants.obstacleMinCenterX &&
+          det.centerX <= AppConstants.obstacleMaxCenterX &&
+          det.centerY >= AppConstants.obstacleMinCenterY;
       final color = isClose
           ? const Color(0xFFFF5252)
           : _colors[det.classId % _colors.length];

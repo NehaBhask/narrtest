@@ -19,9 +19,13 @@ class AppConstants {
   // ── Model Paths ─────────────────────────────────────────
   static const String modelDirName = 'narrator_models';
 
-  // Asset paths for core models bundled in APK (no download needed)
-  static const String yolov8nParamAsset = 'assets/models/yolov8n.ncnn.param';
-  static const String yolov8nBinAsset   = 'assets/models/yolov8n.ncnn.bin';
+  // Asset paths for core models bundled in APK (no download needed).
+  // The YOLO assets now point to the assistive-navigation fine-tuned weights
+  // (7-class: obstacle / stairs / door / hazard / pole / person / vehicle).
+  // Export from Roboflow as "YOLOv8 NCNN" → rename to these two files and
+  // drop them into assets/models/ before building.
+  static const String yolov8nParamAsset = 'assets/models/yolov8n_nav.ncnn.param';
+  static const String yolov8nBinAsset   = 'assets/models/yolov8n_nav.ncnn.bin';
   static const String sileroVadAsset     = 'assets/models/silero_vad.onnx';
 
   // Remote URLs for large optional models (require internet on first use)
@@ -38,14 +42,17 @@ class AppConstants {
   // IndicTrans2 — large model, placeholder stub
   static const String indicTrans2OnnxUrl = '';
 
-  // Legacy URL fields kept for ModelManager compatibility
+  // Legacy URL fields kept for ModelManager compatibility (nav model is bundled)
   static const String yolov8nParamUrl = '';
   static const String yolov8nBinUrl   = '';
   static const String sileroVadOnnxUrl = '';
 
   // ── Model File Names ────────────────────────────────────
-  static const String yolov8nParamFile = 'yolov8n.ncnn.param';
-  static const String yolov8nBinFile = 'yolov8n.ncnn.bin';
+  // Nav-specific YOLOv8n weights (7 classes, NCNN format).
+  // Replace the old yolov8n.ncnn.* files with these in assets/models/.
+  static const String yolov8nParamFile = 'yolov8n_nav.ncnn.param';
+  static const String yolov8nBinFile   = 'yolov8n_nav.ncnn.bin';
+
   static const String smolvlmModelFile = 'SmolVLM-256M-Instruct-Q8_0.gguf';
   static const String smolvlmMmprojFile = 'mmproj-SmolVLM-256M-Instruct-f16.gguf';
   static const String indicTrans2File = 'indictrans2_int8.onnx';
@@ -60,17 +67,33 @@ class AppConstants {
     'indictrans2_int8.onnx': 'placeholder_sha256_indictrans2',
     'SmolVLM-256M-Instruct-Q8_0.gguf': 'placeholder_sha256_smolvlm_model',
     'mmproj-SmolVLM-256M-Instruct-f16.gguf': 'placeholder_sha256_smolvlm_mmproj',
-    'yolov8n.ncnn.param': 'placeholder_sha256_yolo_param',
-    'yolov8n.ncnn.bin': 'placeholder_sha256_yolo_bin',
+    // Update these hashes after downloading the nav model from Roboflow
+    'yolov8n_nav.ncnn.param': 'placeholder_sha256_nav_param',
+    'yolov8n_nav.ncnn.bin':   'placeholder_sha256_nav_bin',
   };
 
   // ── Pipeline 1 Tuning ───────────────────────────────────
   static const int targetFps = 30;
-  static const double obstacleAreaThreshold = 0.12; // 12% of frame area
-  static const int obstacleCooldownMs = 2000;       // 2s between alerts
-  // Pattern: [silence, vibrate, silence, vibrate, silence, vibrate, silence]
-  // Trailing silence ensures the last pulse isn't cut short on all Android devices.
-  static const List<int> obstaclePulsePattern = [0, 80, 60, 80, 60, 80, 0];
+
+  // Obstacle must occupy ≥5% of frame (typical walking distance)
+  static const double obstacleAreaThreshold = 0.05;
+
+  // Obstacle centre must be within the central 70% of frame (0.15 - 0.85).
+  static const double obstacleMinCenterX = 0.15;
+  static const double obstacleMaxCenterX = 0.85;
+
+  // Obstacle must be in the lower 80% of the frame (centerY > 0.20).
+  // This allows for phone tilt without filtering out real obstacles.
+  static const double obstacleMinCenterY = 0.20;
+
+  // Cooldown raised to 5 s so a sustained detection doesn't spam TTS/haptic
+  // and block Pipeline 2 (VLM) from being used.
+  static const int obstacleCooldownMs = 5000;
+
+  // P2 busy guard: if Pipeline 2 is actively speaking/thinking, suppress P1
+  // alerts entirely so the user can hear the VLM response.
+  // Pattern: [silence, vibrate, silence, vibrate, silence]
+  static const List<int> obstaclePulsePattern = [0, 100, 80, 100, 0];
 
   // ── Pipeline 2 Tuning ───────────────────────────────────
   static const int frameBufferSize = 10;

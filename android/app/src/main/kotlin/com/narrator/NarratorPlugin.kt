@@ -21,10 +21,14 @@ class NarratorPlugin : FlutterPlugin, MethodCallHandler {
     private val scope = CoroutineScope(Dispatchers.IO)
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var inferJob: Job? = null
+    
+    // Lock to prevent releasing the YOLO model while inference is ongoing (prevents OpenMP crashes)
+    private val yoloLock = Any()
 
     // ── NCNN native declarations ──────────────────────────────────────────────
     private external fun nativeLoadModel(paramPath: String, binPath: String): Boolean
     private external fun nativeDetectObjects(yuvData: ByteArray, width: Int, height: Int): FloatArray
+    private external fun nativeDetectFromRgb(rgbData: ByteArray, width: Int, height: Int): FloatArray
     private external fun nativeReleaseModel()
 
     companion object {
@@ -42,31 +46,21 @@ class NarratorPlugin : FlutterPlugin, MethodCallHandler {
         }
     }
 
-    // ── JPEG → NV21 conversion (no native dep required) ──────────────────────
-    private fun bitmapToNv21(bitmap: android.graphics.Bitmap): ByteArray {
-        val w = bitmap.width; val h = bitmap.height
+    // ── Direct Bitmap → RGB extraction (no YUV loss) ─────────────────────────
+    private fun bitmapToRgb(bitmap: android.graphics.Bitmap): ByteArray {
+        val w = bitmap.width
+        val h = bitmap.height
         val argb = IntArray(w * h)
         bitmap.getPixels(argb, 0, w, 0, 0, w, h)
-        val nv21 = ByteArray(w * h * 3 / 2)
-        var yIdx = 0; var uvIdx = w * h
-        for (j in 0 until h) {
-            for (i in 0 until w) {
-                val px = argb[j * w + i]
-                val r = (px shr 16) and 0xff
-                val g = (px shr 8)  and 0xff
-                val b =  px        and 0xff
-                nv21[yIdx++] = ((66*r + 129*g + 25*b + 128).shr(8) + 16)
-                    .coerceIn(0, 255).toByte()
-                if (j % 2 == 0 && i % 2 == 0) {
-                    // NV21 = interleaved VU (Cr first, then Cb)
-                    nv21[uvIdx++] = ((112*r - 94*g - 18*b + 128).shr(8) + 128)
-                        .coerceIn(0, 255).toByte()  // Cr (V)
-                    nv21[uvIdx++] = ((-38*r - 74*g + 112*b + 128).shr(8) + 128)
-                        .coerceIn(0, 255).toByte()  // Cb (U)
-                }
-            }
+        
+        val rgb = ByteArray(w * h * 3)
+        var idx = 0
+        for (px in argb) {
+            rgb[idx++] = ((px shr 16) and 0xff).toByte() // R
+            rgb[idx++] = ((px shr 8)  and 0xff).toByte() // G
+            rgb[idx++] = ( px         and 0xff).toByte() // B
         }
-        return nv21
+        return rgb
     }
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -109,16 +103,19 @@ class NarratorPlugin : FlutterPlugin, MethodCallHandler {
                 val binPath = call.argument<String>("binPath") ?: run {
                     result.error("INVALID_ARGS", "binPath missing", null); return }
                 scope.launch {
-                    val ok = try { nativeLoadModel(paramPath, binPath) }
-                             catch (t: Throwable) {
-                                 android.util.Log.e("NarratorPlugin", "nativeLoadModel threw: ${t.message}")
-                                 false
-                             }
+                    val ok = try {
+                        synchronized(yoloLock) {
+                            nativeLoadModel(paramPath, binPath)
+                        }
+                    } catch (t: Throwable) {
+                        android.util.Log.e("NarratorPlugin", "nativeLoadModel threw: ${t.message}")
+                        false
+                    }
                     mainHandler.post { result.success(ok) }
                 }
             }
 
-            // Accept JPEG bytes, decode to Bitmap, convert to NV21, run inference
+            // Accept JPEG bytes, decode to Bitmap, extract RGB, run inference
             "detectFromJpeg" -> {
                 if (!nativeLibraryLoaded) { result.success(listOf<Float>()); return }
                 val jpegData = call.argument<ByteArray>("jpegData") ?: run {
@@ -131,8 +128,14 @@ class NarratorPlugin : FlutterPlugin, MethodCallHandler {
                             android.util.Log.e("NarratorPlugin", "detectFromJpeg: BitmapFactory returned null")
                             emptyList<Float>()
                         } else {
-                            val nv21 = bitmapToNv21(bmp)
-                            nativeDetectObjects(nv21, bmp.width, bmp.height).toList()
+                            val rgb = bitmapToRgb(bmp)
+                            synchronized(yoloLock) {
+                                if (Companion.nativeLibraryLoaded) {
+                                    nativeDetectFromRgb(rgb, bmp.width, bmp.height).toList()
+                                } else {
+                                    emptyList<Float>()
+                                }
+                            }
                         }
                     } catch (t: Throwable) {
                         android.util.Log.e("NarratorPlugin", "detectFromJpeg: ${t.message}")
@@ -150,11 +153,18 @@ class NarratorPlugin : FlutterPlugin, MethodCallHandler {
                 val w = call.argument<Int>("width") ?: 0
                 val h = call.argument<Int>("height") ?: 0
                 scope.launch {
-                    val dets = try { nativeDetectObjects(yuv, w, h).toList() }
-                               catch (t: Throwable) {
-                                   android.util.Log.e("NarratorPlugin", "detectObjects: ${t.message}")
-                                   emptyList<Float>()
-                               }
+                    val dets = try {
+                        synchronized(yoloLock) {
+                            if (Companion.nativeLibraryLoaded) {
+                                nativeDetectObjects(yuv, w, h).toList()
+                            } else {
+                                emptyList<Float>()
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        android.util.Log.e("NarratorPlugin", "detectObjects: ${t.message}")
+                        emptyList<Float>()
+                    }
                     mainHandler.post { result.success(dets) }
                 }
             }
@@ -162,7 +172,11 @@ class NarratorPlugin : FlutterPlugin, MethodCallHandler {
             "releaseYoloModel" -> {
                 if (!nativeLibraryLoaded) { result.success(null); return }
                 scope.launch {
-                    try { nativeReleaseModel() } catch (_: Throwable) {}
+                    try {
+                        synchronized(yoloLock) {
+                            nativeReleaseModel()
+                        }
+                    } catch (_: Throwable) {}
                     mainHandler.post { result.success(null) }
                 }
             }
