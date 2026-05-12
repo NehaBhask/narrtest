@@ -1,0 +1,184 @@
+import 'dart:async';
+import 'dart:typed_data';
+import 'package:camera/camera.dart';
+import 'package:logger/logger.dart';
+import 'yolo_ncnn_runner.dart';
+import 'obstacle_detector.dart';
+import '../pipeline2/frame_selector.dart';
+import '../../services/haptic_service.dart';
+import '../../services/tts_service.dart';
+import '../../services/language_service.dart';
+import '../../core/constants.dart';
+
+enum Pipeline1State { idle, running, paused }
+
+/// Pipeline 1 — continuous obstacle detection via YOLO.
+///
+/// WHY no startImageStream:
+/// On RMX3092, startImageStream forces a camera session reconfiguration that
+/// kills the preview texture. Instead we use takePicture() on a 500ms timer
+/// which works within the existing preview session with no reconfiguration.
+class SafetyCoordinator {
+  SafetyCoordinator._();
+  static final SafetyCoordinator instance = SafetyCoordinator._();
+
+  final _log = Logger();
+  final _yolo = YoloNcnnRunner.instance;
+  final _detector = ObstacleDetector();
+
+  Pipeline1State _state = Pipeline1State.idle;
+  Pipeline1State get state => _state;
+
+  // _controller is kept so callers can attachController() without error,
+  // but takePicture() is driven by FrameSelector, not directly here.
+  CameraController? _controller; // ignore: unused_field
+  bool _inferring = false;
+
+  DateTime? _lastAlertTime;
+  int _frameCount = 0;
+  int _detectionCount = 0;
+  double _currentFps = 0.0;
+  DateTime? _fpsTimer;
+  StreamSubscription? _frameSub;
+
+  // Exposed so UI can show whether native YOLO .so loaded correctly
+  bool get nativeLibLoaded => YoloNcnnRunner.nativeLibraryLoaded;
+
+  final _detectionsController =
+      StreamController<List<YoloDetection>>.broadcast();
+  Stream<List<YoloDetection>> get detectionsStream =>
+      _detectionsController.stream;
+  double get currentFps => _currentFps;
+
+  /// Must be called after camera controller is initialised.
+  void attachController(CameraController controller) {
+    _controller = controller;
+  }
+
+  Future<void> start() async {
+    if (_state == Pipeline1State.running) return;
+
+    // Surface native lib status before attempting model load
+    if (!YoloNcnnRunner.nativeLibraryLoaded) {
+      _log.e('P1: narrator_ncnn.so failed to load — YOLO disabled. '
+          'Check that the native library was compiled and packaged correctly.');
+      return;
+    }
+
+    final loaded = await _yolo.loadModel();
+    if (!loaded) {
+      _log.e('P1: YOLOv8 model load failed — safety pipeline inactive. '
+          'Check that yolov8n.ncnn.param and yolov8n.ncnn.bin are present in assets/models/');
+      return;
+    }
+
+    _state = Pipeline1State.running;
+    _startTimer();
+    _log.i('Pipeline 1 started — YOLO running');
+  }
+
+  void _startTimer() {
+    _frameSub?.cancel();
+    _frameSub = FrameSelector.instance.frameStream.listen((jpegBytes) {
+      _runInference(jpegBytes);
+    });
+  }
+
+  Future<void> _runInference(Uint8List jpegBytes) async {
+    if (_state != Pipeline1State.running) return;
+    if (_inferring) return;
+
+    _inferring = true;
+    try {
+      _frameCount++;
+      if (_frameCount % 5 == 0) {
+        final now = DateTime.now();
+        if (_fpsTimer != null) {
+          _currentFps = 5000 / now.difference(_fpsTimer!).inMilliseconds;
+        }
+        _fpsTimer = now;
+      }
+
+      // Run YOLO on JPEG bytes
+      final detections = await _yolo.detectFromJpeg(jpegBytes);
+
+      if (!_detectionsController.isClosed) {
+        _detectionsController.add(detections);
+      }
+
+      final threat = _detector.mostThreateningObstacle(detections);
+      if (threat != null) {
+        _detectionCount++;
+        await _triggerAlert(threat);
+      }
+
+      if (detections.isNotEmpty) {
+        _log.d('P1: ${detections.length} detections, '
+            'top=${detections.first.confidence.toStringAsFixed(2)}');
+      }
+    } catch (e) {
+      _log.d('P1 inference skipped: $e');
+    } finally {
+      _inferring = false;
+    }
+  }
+
+  Future<void> _triggerAlert(YoloDetection threat) async {
+    final now = DateTime.now();
+    if (_lastAlertTime != null &&
+        now.difference(_lastAlertTime!).inMilliseconds <
+            AppConstants.obstacleCooldownMs) {
+      return;
+    }
+    _lastAlertTime = now;
+
+    final distance = _detector.estimateDistanceM(threat);
+    _log.i('🚨 Obstacle! class=${threat.classId}, '
+        'conf=${threat.confidence.toStringAsFixed(2)}, '
+        'dist≈${distance.toStringAsFixed(1)}m');
+
+    // Fire haptic and TTS concurrently — no need to wait for vibration before speaking
+    final msg = LanguageService.instance.obstacleAlertText;
+    await Future.wait([
+      HapticService.instance.obstacleAlert(),
+      TtsService.instance.speakAlert(msg),
+    ]);
+  }
+
+  void pause() {
+    if (_state == Pipeline1State.running) {
+      _frameSub?.pause();
+      _state = Pipeline1State.paused;
+      _log.i('Pipeline 1 paused');
+    }
+  }
+
+  void resume() {
+    if (_state == Pipeline1State.paused) {
+      _frameSub?.resume();
+      _state = Pipeline1State.running;
+      _log.i('Pipeline 1 resumed');
+    }
+  }
+
+  Future<void> stop() async {
+    _frameSub?.cancel();
+    _frameSub = null;
+    await _yolo.release();
+    _state = Pipeline1State.idle;
+    _log.i('Pipeline 1 stopped');
+  }
+
+  void dispose() {
+    _frameSub?.cancel();
+    _frameSub = null;
+    // Delay closing the stream briefly to let any in-flight _runInference
+    // finish its current add() call before the controller is closed.
+    Future.delayed(const Duration(milliseconds: 100), () {
+      if (!_detectionsController.isClosed) _detectionsController.close();
+    });
+  }
+
+  int get frameCount => _frameCount;
+  int get detectionCount => _detectionCount;
+}
