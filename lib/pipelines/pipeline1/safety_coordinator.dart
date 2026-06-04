@@ -17,8 +17,8 @@ enum Pipeline1State { idle, running, paused }
 ///
 /// WHY no startImageStream:
 /// On RMX3092, startImageStream forces a camera session reconfiguration that
-/// kills the preview texture. Instead we use takePicture() on a 500ms timer
-/// which works within the existing preview session with no reconfiguration.
+/// kills the preview texture. Instead we use takePicture() on a 300ms timer
+/// driven by FrameSelector, which works within the existing preview session.
 class SafetyCoordinator {
   SafetyCoordinator._();
   static final SafetyCoordinator instance = SafetyCoordinator._();
@@ -30,8 +30,6 @@ class SafetyCoordinator {
   Pipeline1State _state = Pipeline1State.idle;
   Pipeline1State get state => _state;
 
-  // _controller is kept so callers can attachController() without error,
-  // but takePicture() is driven by FrameSelector, not directly here.
   CameraController? _controller; // ignore: unused_field
   bool _inferring = false;
 
@@ -42,7 +40,6 @@ class SafetyCoordinator {
   DateTime? _fpsTimer;
   StreamSubscription? _frameSub;
 
-  // Exposed so UI can show whether native YOLO .so loaded correctly
   bool get nativeLibLoaded => YoloNcnnRunner.nativeLibraryLoaded;
 
   final _detectionsController =
@@ -59,7 +56,6 @@ class SafetyCoordinator {
   Future<void> start() async {
     if (_state == Pipeline1State.running) return;
 
-    // Surface native lib status before attempting model load
     if (!YoloNcnnRunner.nativeLibraryLoaded) {
       _log.e('P1: narrator_ncnn.so failed to load — YOLO disabled. '
           'Check that the native library was compiled and packaged correctly.');
@@ -69,16 +65,17 @@ class SafetyCoordinator {
     final loaded = await _yolo.loadModel();
     if (!loaded) {
       _log.e('P1: YOLOv8 model load failed — safety pipeline inactive. '
-          'Check that yolov8n.ncnn.param and yolov8n.ncnn.bin are present in assets/models/');
+          'Check that yolov8n.ncnn.param and yolov8n.ncnn.bin are present '
+          'in assets/models/ (standard COCO 80-class NCNN export).');
       return;
     }
 
     _state = Pipeline1State.running;
-    _startTimer();
-    _log.i('Pipeline 1 started — YOLO running');
+    _startListener();
+    _log.i('Pipeline 1 started — YOLO running (conf≥${AppConstants.minConfidenceThreshold})');
   }
 
-  void _startTimer() {
+  void _startListener() {
     _frameSub?.cancel();
     _frameSub = FrameSelector.instance.frameStream.listen((jpegBytes) {
       _runInference(jpegBytes);
@@ -87,7 +84,7 @@ class SafetyCoordinator {
 
   Future<void> _runInference(Uint8List jpegBytes) async {
     if (_state != Pipeline1State.running) return;
-    if (_inferring) return;
+    if (_inferring) return; // drop frame if previous inference still running
 
     _inferring = true;
     try {
@@ -100,7 +97,6 @@ class SafetyCoordinator {
         _fpsTimer = now;
       }
 
-      // Run YOLO on JPEG bytes
       final detections = await _yolo.detectFromJpeg(jpegBytes);
 
       if (!_detectionsController.isClosed) {
@@ -115,7 +111,8 @@ class SafetyCoordinator {
 
       if (detections.isNotEmpty) {
         _log.d('P1: ${detections.length} detections, '
-            'top=${detections.first.confidence.toStringAsFixed(2)}');
+            'top=${detections.first.className} '
+            '${(detections.first.confidence * 100).toInt()}%');
       }
     } catch (e) {
       _log.d('P1 inference skipped: $e');
@@ -134,8 +131,9 @@ class SafetyCoordinator {
     }
 
     // ── Guard 2: never interrupt P2 speaking/thinking ───────────────────
-    // If the user has asked a question and the VLM is responding, let them
-    // hear the answer. P1 will resume alerting once P2 goes back to idle.
+    // Allow alerts to fire while P2 is awaitingWakeWord or idle.
+    // Suppress only during active user interaction (recording, transcribing,
+    // thinking, speaking) so the VLM answer is not cut off.
     final p2State = ConversationCoordinator.instance.state;
     if (p2State == Pipeline2State.speaking ||
         p2State == Pipeline2State.thinking ||
@@ -147,35 +145,104 @@ class SafetyCoordinator {
 
     _lastAlertTime = now;
 
+    final dir      = _detector.direction(threat);
+    final urgent   = _detector.isUrgent(threat);
     final distance = _detector.estimateDistanceM(threat);
+
     _log.i('🚨 Obstacle! class=${threat.className}, '
         'conf=${threat.confidence.toStringAsFixed(2)}, '
+        'dir=$dir, urgent=$urgent, '
         'dist≈${distance.toStringAsFixed(1)}m, '
-        'area=${threat.area.toStringAsFixed(2)}, '
-        'cx=${threat.centerX.toStringAsFixed(2)}, '
-        'cy=${threat.centerY.toStringAsFixed(2)}');
+        'area=${threat.area.toStringAsFixed(2)}');
 
-    // Build a message that names the object so it’s more useful than just
-    // "obstacle ahead" — e.g. "person ahead" or "chair ahead".
     final lang  = LanguageService.instance.currentCode;
-    final label = threat.className;   // already in English from COCO names
-    final msg   = _buildAlertMessage(lang, label);
+    final label = threat.className;
+    final msg   = _buildAlertMessage(lang, label, dir, urgent);
 
-    // Fire haptic first (instant), then TTS (tiny delay acceptable)
-    await HapticService.instance.obstacleAlert();
+    // ── Fire haptic and TTS in parallel for minimum latency ────────────
+    // Haptic gives ~instant tactile feedback while TTS is initialising.
+    // We do NOT await the haptic — both fire simultaneously.
+    unawaited(HapticService.instance.obstacleAlert());
     await TtsService.instance.speakAlert(msg);
   }
 
-  /// Build a localised alert string that names the detected object.
-  String _buildAlertMessage(String langCode, String objectName) {
+  /// Build a localised, direction-aware alert string.
+  ///
+  /// Examples:
+  ///   EN: "Warning! Person ahead"  or  "Car on your left"
+  ///   HI: "चेतावनी! आगे person है"  or  "बाईं तरफ car है"
+  String _buildAlertMessage(
+      String langCode, String objectName, String direction, bool urgent) {
+    final warn = urgent ? _urgentPrefix(langCode) : '';
+
     switch (langCode) {
-      case 'hi': return 'आगे $objectName है, सावधान';
-      case 'ta': return 'முன்னால் $objectName உள்ளது';
-      case 'te': return 'ముందు $objectName ఉంది';
-      case 'bn': return 'সামনে $objectName আছে';
-      case 'mr': return 'पुढे $objectName आहे';
-      case 'kn': return 'ಮುಂದೆ $objectName ಇದೆ';
-      default:   return '$objectName ahead';
+      case 'hi':
+        final dirHi = direction == 'left'
+            ? 'बाईं तरफ'
+            : direction == 'right'
+                ? 'दाईं तरफ'
+                : 'आगे';
+        return '${warn}$dirHi $objectName है, सावधान';
+
+      case 'ta':
+        final dirTa = direction == 'left'
+            ? 'இடதுபக்கம்'
+            : direction == 'right'
+                ? 'வலதுபக்கம்'
+                : 'முன்னால்';
+        return '${warn}$dirTa $objectName உள்ளது';
+
+      case 'te':
+        final dirTe = direction == 'left'
+            ? 'ఎడమవైపు'
+            : direction == 'right'
+                ? 'కుడివైపు'
+                : 'ముందు';
+        return '${warn}$dirTe $objectName ఉంది';
+
+      case 'bn':
+        final dirBn = direction == 'left'
+            ? 'বামদিকে'
+            : direction == 'right'
+                ? 'ডানদিকে'
+                : 'সামনে';
+        return '${warn}$dirBn $objectName আছে';
+
+      case 'mr':
+        final dirMr = direction == 'left'
+            ? 'डावीकडे'
+            : direction == 'right'
+                ? 'उजवीकडे'
+                : 'पुढे';
+        return '${warn}$dirMr $objectName आहे';
+
+      case 'kn':
+        final dirKn = direction == 'left'
+            ? 'ಎಡಭಾಗದಲ್ಲಿ'
+            : direction == 'right'
+                ? 'ಬಲಭಾಗದಲ್ಲಿ'
+                : 'ಮುಂದೆ';
+        return '${warn}$dirKn $objectName ಇದೆ';
+
+      default: // English
+        final dirEn = direction == 'left'
+            ? 'on your left'
+            : direction == 'right'
+                ? 'on your right'
+                : 'ahead';
+        return '${warn}$objectName $dirEn';
+    }
+  }
+
+  String _urgentPrefix(String langCode) {
+    switch (langCode) {
+      case 'hi': return 'चेतावनी! ';
+      case 'ta': return 'எச்சரிக்கை! ';
+      case 'te': return 'హెచ్చరిక! ';
+      case 'bn': return 'সতর্কতা! ';
+      case 'mr': return 'इशारा! ';
+      case 'kn': return 'ಎಚ್ಚರಿಕೆ! ';
+      default:   return 'Warning! ';
     }
   }
 
@@ -206,8 +273,6 @@ class SafetyCoordinator {
   void dispose() {
     _frameSub?.cancel();
     _frameSub = null;
-    // Delay closing the stream briefly to let any in-flight _runInference
-    // finish its current add() call before the controller is closed.
     Future.delayed(const Duration(milliseconds: 100), () {
       if (!_detectionsController.isClosed) _detectionsController.close();
     });
@@ -215,4 +280,9 @@ class SafetyCoordinator {
 
   int get frameCount => _frameCount;
   int get detectionCount => _detectionCount;
+}
+
+// ignore: nothing_returned
+void unawaited(Future<void> future) {
+  // Intentionally not awaited — fire-and-forget for parallel execution.
 }

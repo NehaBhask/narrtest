@@ -1,19 +1,20 @@
+import 'dart:math';
 import 'yolo_ncnn_runner.dart';
 import '../../core/constants.dart';
 
 /// Classifies whether a detection is a genuine in-path obstacle.
 ///
-/// Because EVERY class in the nav-model (obstacle, stairs, door, hazard,
-/// pole, person, vehicle) is inherently a navigation concern, we no longer
-/// filter by class ID.  Instead we apply three geometric guards:
-///
-///   1. Area  ≥ obstacleAreaThreshold  (object is large/close enough)
-///   2. CenterX in [obstacleMinCenterX, obstacleMaxCenterX]  (in walking path)
-///   3. CenterY ≥ obstacleMinCenterY  (not a distant/background object at top)
+/// Filtering layers (applied in order):
+///   1. Class relevance  — only COCO classes meaningful for pedestrian nav
+///   2. Confidence       — already filtered in _parseResult (≥ minConfidenceThreshold)
+///   3. Area             — object is large/close enough (≥ obstacleAreaThreshold)
+///   4. CenterX          — in the walking path, not to the far side
+///   5. CenterY          — not a background/sky object at the top of frame
 ///
 /// This eliminates false positives from:
-///   • Tiny far-away objects (a person 20 m down the street)
-///   • Objects at the frame edges (pole glimpsed on the far right)
+///   • Irrelevant classes (spoon, kite, toothbrush…)
+///   • Tiny far-away objects (person 20 m away)
+///   • Objects at the frame edges
 ///   • Elevated objects the user is not about to walk into
 class ObstacleDetector {
   ObstacleDetector();
@@ -33,25 +34,59 @@ class ObstacleDetector {
   }
 
   bool _isInPath(YoloDetection d) {
-    // 1. Must be large enough to be a real near-field obstacle
+    // 1. Must be a navigation-relevant COCO class
+    if (!AppConstants.navigationRelevantClassIds.contains(d.classId)) {
+      return false;
+    }
+
+    // 2. Must be large enough to be a real near-field obstacle
     if (d.area < AppConstants.obstacleAreaThreshold) return false;
 
-    // 2. Must be horizontally centred (in the walking path, not to the side)
+    // 3. Must be horizontally centred (in the walking path, not to the side)
     if (d.centerX < AppConstants.obstacleMinCenterX ||
         d.centerX > AppConstants.obstacleMaxCenterX) return false;
 
-    // 3. Must be in the lower/mid portion of the frame.
+    // 4. Must be in the lower/mid portion of the frame.
     // Objects near the very top of frame are background or distant.
     if (d.centerY < AppConstants.obstacleMinCenterY) return false;
 
     return true;
   }
 
-  /// Estimate rough distance in metres using inverse-square heuristic.
-  /// Calibrated empirically: person at 1.5 m ≈ 25 % area.
+  /// Rough direction relative to the camera's field of view.
+  /// Returns 'left', 'ahead', or 'right' based on bounding box centre.
+  String direction(YoloDetection d) {
+    if (d.centerX < 0.38) return 'left';
+    if (d.centerX > 0.62) return 'right';
+    return 'ahead';
+  }
+
+  /// Whether the obstacle is critically close (very large in frame).
+  bool isUrgent(YoloDetection d) =>
+      d.area >= AppConstants.obstacleUrgentAreaThreshold;
+
+  /// Estimate rough distance in metres using class-aware inverse-square heuristic.
+  ///
+  /// Reference: object at real height H, filling fraction f of frame height
+  ///   → k = f * H²
+  ///
+  /// | Class   | H (m) | k approx |
+  /// |---------|-------|----------|
+  /// | person  | 1.70  | 0.87     |
+  /// | car     | 1.50  | 0.56     |
+  /// | bus     | 3.00  | 1.20     |
+  /// | other   | 1.20  | 0.29     |
   double estimateDistanceM(YoloDetection d) {
-    // area ≈ k / distance²  →  distance ≈ sqrt(k / area)
-    const k = 0.25 * 1.5 * 1.5;
-    return (k / d.area).clamp(0.3, 10.0);
+    final double k;
+    switch (d.classId) {
+      case 0:  k = 0.87; break; // person
+      case 2:  k = 0.56; break; // car
+      case 3:  k = 0.40; break; // motorcycle
+      case 5:  k = 1.20; break; // bus
+      case 7:  k = 1.20; break; // truck
+      default: k = 0.29;
+    }
+    // distance ≈ sqrt(k / area), clamped to [0.3, 15.0] metres
+    return sqrt(k / d.area).clamp(0.3, 15.0);
   }
 }

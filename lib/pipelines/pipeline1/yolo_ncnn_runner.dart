@@ -5,26 +5,12 @@ import '../../core/model_manager.dart';
 import '../../core/constants.dart';
 import 'dart:io';
 
-// ── Assistive-Navigation class names ─────────────────────────────────────────
-// Order MUST match the label indices in the Roboflow-exported NCNN model.
-// Dataset: "Obstacle Detection for Assistive Navigation" (Roboflow Universe)
-// Classes (index 0–6):
-//   0 obstacle  — generic blocking object
-//   1 stairs    — step / staircase in path
-//   2 door      — door (open or closed)
-//   3 hazard    — wet floor, construction, etc.
-//   4 pole      — lamp-post, bollard, signpost
-//   5 person    — pedestrian / bystander
-//   6 vehicle   — car, bike, bus, auto-rickshaw
-const List<String> navClassNames = [
-  'obstacle',
-  'stairs',
-  'door',
-  'hazard',
-  'pole',
-  'person',
-  'vehicle',
-];
+// ── COCO 80-Class Names ───────────────────────────────────────────────────────
+// Alias to AppConstants for easy access throughout this file.
+// Index MUST match the NCNN-exported YOLOv8n COCO model label order.
+// To verify your model's label order, check the .param file's output layer
+// or run: yolo predict model=yolov8n.pt source=your_image.jpg
+List<String> get _cocoNames => AppConstants.cocoClassNames;
 
 class YoloDetection {
   final int classId;
@@ -40,10 +26,10 @@ class YoloDetection {
     required this.y2,
   });
 
-  /// Human-readable class name e.g. "person", "stairs", "vehicle"
+  /// Human-readable COCO class name e.g. "person", "car", "chair"
   String get className =>
-      (classId >= 0 && classId < navClassNames.length)
-          ? navClassNames[classId]
+      (classId >= 0 && classId < _cocoNames.length)
+          ? _cocoNames[classId]
           : 'cls$classId';
 
   double get area    => (x2 - x1) * (y2 - y1);
@@ -102,7 +88,9 @@ class YoloNcnnRunner {
         'binPath':   binPath,
       });
       _isLoaded = result ?? false;
-      _log.i('YOLOv8 nav-model loaded: $_isLoaded  (${navClassNames.length} classes)');
+      _log.i('YOLOv8 COCO model loaded: $_isLoaded  '
+          '(${_cocoNames.length} classes, '
+          '${AppConstants.navigationRelevantClassIds.length} nav-relevant)');
       return _isLoaded;
     } catch (e) {
       _log.e('Error loading YOLO model: $e');
@@ -133,7 +121,9 @@ class YoloNcnnRunner {
 
   List<YoloDetection> _parseResult(List<dynamic>? raw) {
     if (raw == null || raw.isEmpty) return [];
-    final detections = <YoloDetection>[];
+
+    final rawDetections = <YoloDetection>[];
+
     for (int i = 0; i + 6 <= raw.length; i += 6) {
       final classId    = (raw[i]     as num).toInt();
       final confidence = (raw[i + 1] as num).toDouble();
@@ -142,24 +132,77 @@ class YoloNcnnRunner {
       final x2         = (raw[i + 4] as num).toDouble();
       final y2         = (raw[i + 5] as num).toDouble();
 
-      // Guard: skip any classId outside the nav-model range (0–6)
-      if (classId < 0 || classId >= navClassNames.length) {
-        _log.w('_parseResult: skipping out-of-range classId=$classId (raw idx $i)');
+      // ── Guard 1: valid COCO class ID (0–79)
+      if (classId < 0 || classId >= _cocoNames.length) {
+        _log.w('_parseResult: skipping out-of-range classId=$classId');
         continue;
       }
-      // Guard: skip degenerate boxes
+
+      // ── Guard 2: confidence threshold — suppress ghost boxes
+      if (confidence < AppConstants.minConfidenceThreshold) {
+        _log.d('_parseResult: skipping low-confidence '
+            'classId=$classId conf=${confidence.toStringAsFixed(2)}');
+        continue;
+      }
+
+      // ── Guard 3: degenerate bounding box
       if (x2 <= x1 || y2 <= y1) continue;
 
-      detections.add(YoloDetection(
+      rawDetections.add(YoloDetection(
         classId:    classId,
         confidence: confidence,
         x1: x1, y1: y1, x2: x2, y2: y2,
       ));
     }
-    detections.sort((a, b) => b.confidence.compareTo(a.confidence));
-    _log.d('_parseResult: ${detections.length} valid detections '
-        '(raw floats=${raw.length}, packets=${raw.length ~/ 6})');
+
+    // ── Sort by confidence descending before NMS
+    rawDetections.sort((a, b) => b.confidence.compareTo(a.confidence));
+
+    // ── Dart-side NMS: suppress overlapping boxes of the same class
+    final detections = _applyNms(rawDetections);
+
+    _log.d('_parseResult: ${detections.length} detections after NMS '
+        '(raw=${raw.length ~/ 6} packets, '
+        'minConf=${AppConstants.minConfidenceThreshold})');
     return detections;
+  }
+
+  /// Non-Maximum Suppression — removes duplicate overlapping boxes.
+  ///
+  /// Algorithm: greedy NMS per class.
+  ///   1. Sort by confidence (already done before calling).
+  ///   2. For each box, suppress any lower-confidence box of the same class
+  ///      whose IoU with the current box exceeds [AppConstants.nmsIouThreshold].
+  List<YoloDetection> _applyNms(List<YoloDetection> sorted) {
+    final kept = <YoloDetection>[];
+    final suppressed = List<bool>.filled(sorted.length, false);
+
+    for (int i = 0; i < sorted.length; i++) {
+      if (suppressed[i]) continue;
+      kept.add(sorted[i]);
+      for (int j = i + 1; j < sorted.length; j++) {
+        if (suppressed[j]) continue;
+        // Only suppress same-class boxes
+        if (sorted[j].classId != sorted[i].classId) continue;
+        if (_iou(sorted[i], sorted[j]) > AppConstants.nmsIouThreshold) {
+          suppressed[j] = true;
+        }
+      }
+    }
+    return kept;
+  }
+
+  /// Intersection over Union for two bounding boxes.
+  double _iou(YoloDetection a, YoloDetection b) {
+    final ix1 = a.x1 > b.x1 ? a.x1 : b.x1;
+    final iy1 = a.y1 > b.y1 ? a.y1 : b.y1;
+    final ix2 = a.x2 < b.x2 ? a.x2 : b.x2;
+    final iy2 = a.y2 < b.y2 ? a.y2 : b.y2;
+
+    if (ix2 <= ix1 || iy2 <= iy1) return 0.0;
+    final intersection = (ix2 - ix1) * (iy2 - iy1);
+    final union = a.area + b.area - intersection;
+    return union <= 0 ? 0.0 : intersection / union;
   }
 
   Future<void> release() async {

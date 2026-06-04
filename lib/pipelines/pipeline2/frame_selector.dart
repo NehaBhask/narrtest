@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:logger/logger.dart';
+import '../../core/constants.dart';
 
 /// Captures frames via takePicture() on a timer.
 ///
@@ -12,6 +13,9 @@ import 'package:logger/logger.dart';
 /// reconfiguration, which disconnects the preview SurfaceTexture → black screen.
 /// takePicture() uses a still-capture request on the EXISTING session — no
 /// reconfiguration, no SurfaceTexture disconnect, preview stays live.
+///
+/// Capture interval is controlled by [AppConstants.captureIntervalMs] (300ms),
+/// giving ~3.3 effective YOLO fps without conflicting with the preview session.
 class FrameSelector {
   FrameSelector._();
   static final FrameSelector instance = FrameSelector._();
@@ -36,11 +40,12 @@ class FrameSelector {
 
   void _startTimer() {
     _captureTimer?.cancel();
-    // Capture a fresh frame every 800ms — frequent enough for scene changes,
-    // slow enough not to interfere with the preview session.
-    _captureTimer = Timer.periodic(const Duration(milliseconds: 800), (_) {
-      _captureFrame();
-    });
+    // Capture a frame every captureIntervalMs (300ms).
+    // This gives ~3.3 effective YOLO fps — far better than the prior 800ms.
+    _captureTimer = Timer.periodic(
+      Duration(milliseconds: AppConstants.captureIntervalMs),
+      (_) => _captureFrame(),
+    );
   }
 
   Future<void> _captureFrame() async {
@@ -53,7 +58,7 @@ class FrameSelector {
     try {
       final xFile = await _controller!.takePicture();
       final bytes = await File(xFile.path).readAsBytes();
-      // Clean up temp file immediately
+      // Clean up temp file immediately to avoid storage accumulation
       await File(xFile.path).delete();
       _lastFrame = bytes;
       _lastFrameTime = DateTime.now();
@@ -69,12 +74,14 @@ class FrameSelector {
   }
 
   /// Returns the most recently captured JPEG frame.
-  /// If no frame has been captured yet, waits up to 3 seconds for one.
+  ///
+  /// Accepts frames up to [AppConstants.maxFrameAgeMs] (800ms) old.
+  /// If the cached frame is stale or missing, captures a fresh one and waits.
   Future<Uint8List?> selectSharpestFrame() async {
-    // If we already have a recent frame (< 2s old), return it immediately
+    // If we already have a recent frame, return it immediately
     if (_lastFrame != null && _lastFrameTime != null) {
       final age = DateTime.now().difference(_lastFrameTime!).inMilliseconds;
-      if (age < 2000) {
+      if (age < AppConstants.maxFrameAgeMs) {
         _log.i('Frame selected, age=${age}ms');
         return _lastFrame;
       }
@@ -108,6 +115,8 @@ class FrameSelector {
     _captureTimer?.cancel();
     _captureTimer = null;
     _controller = null;
-    _frameStreamController.close();
+    if (!_frameStreamController.isClosed) {
+      _frameStreamController.close();
+    }
   }
 }

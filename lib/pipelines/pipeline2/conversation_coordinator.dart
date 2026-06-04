@@ -10,6 +10,8 @@ import 'translation_engine.dart';
 import 'vlm_runner.dart';
 import 'streaming_tts.dart';
 import '../../services/language_service.dart';
+import '../../services/haptic_service.dart';
+import '../../services/tts_service.dart';
 
 enum Pipeline2State {
   idle, awaitingWakeWord, recording, transcribing, thinking, speaking, error
@@ -59,15 +61,40 @@ class ConversationCoordinator {
   Future<void> _onWakeWordDetected() async {
     _setState(Pipeline2State.recording);
     SileroVad.instance.reset();
-    final micStream = await _audioRecorder.startStream(
-      const RecordConfig(
-        encoder: AudioEncoder.pcm16bits,
-        sampleRate: 16000,
-        numChannels: 1,
-      ),
-    );
-    micStream.listen((chunk) => SileroVad.instance.feed(chunk));
+
+    // ── Simultaneous haptic + TTS listening cue ─────────────────────────
+    // The blind user MUST know the mic is now open.
+    // Fire both in parallel so there is no delay.
+    unawaited(HapticService.instance.listeningPulse());
+    unawaited(TtsService.instance.speakImmediate(
+      _listeningMessage(LanguageService.instance.currentCode),
+    ));
+
+    try {
+      final micStream = await _audioRecorder.startStream(
+        const RecordConfig(
+          encoder: AudioEncoder.pcm16bits,
+          sampleRate: 16000,
+          numChannels: 1,
+        ),
+      );
+      micStream.listen(
+        (chunk) => SileroVad.instance.feed(chunk),
+        onError: (Object err) {
+          _log.e('Mic stream error: $err');
+          _setState(Pipeline2State.awaitingWakeWord);
+        },
+        cancelOnError: true,
+      );
+    } catch (e, stack) {
+      _log.e('Could not start microphone: $e\n$stack');
+      const msg = 'Microphone unavailable. Please check permissions.';
+      _responseController.add(msg);
+      unawaited(TtsService.instance.speakImmediate(msg));
+      _setState(Pipeline2State.awaitingWakeWord);
+    }
   }
+
 
   Future<void> _onSpeechEnd(Uint8List audioBytes) async {
     final currentInteraction = ++_interactionId;
@@ -87,7 +114,9 @@ class ConversationCoordinator {
       _transcriptController.add(transcript);
 
       if (transcript.trim().isEmpty) {
-        _responseController.add("I didn't hear anything. Please try again.");
+        final emptyMsg = _emptyTranscriptMessage(LanguageService.instance.currentCode);
+        _responseController.add(emptyMsg);
+        unawaited(TtsService.instance.speakImmediate(emptyMsg));
         _setState(Pipeline2State.awaitingWakeWord);
         return;
       }
@@ -100,7 +129,9 @@ class ConversationCoordinator {
 
       // 4. Frame check
       if (frameJpeg == null) {
-        _responseController.add('I could not capture a frame. Please try again.');
+        const msg = 'I could not capture a frame. Please try again.';
+        _responseController.add(msg);
+        unawaited(TtsService.instance.speakImmediate(msg));
         _setState(Pipeline2State.awaitingWakeWord);
         return;
       }
@@ -120,7 +151,9 @@ class ConversationCoordinator {
       if (_interactionId != currentInteraction) return;
 
       if (response.isEmpty) {
-        _responseController.add('No response. Please try again.');
+        final msg = _noResponseMessage(userLang);
+        _responseController.add(msg);
+        unawaited(TtsService.instance.speakImmediate(msg));
         _setState(Pipeline2State.awaitingWakeWord);
         return;
       }
@@ -128,16 +161,14 @@ class ConversationCoordinator {
       // 6. Show full response in UI (TTS already streaming)
       _responseController.add(response);
 
-      // 7. Wait for TTS to finish (streaming_tts handles speaking)
-      // speakResponse was already triggered by startStreaming above
-      if (_interactionId != currentInteraction) return;
-
       _log.i('Done: "${response.substring(0, response.length.clamp(0, 60))}"');
 
     } catch (e, stack) {
       if (_interactionId != currentInteraction) return;
       _log.e('Pipeline error: $e\n$stack');
-      _responseController.add('An error occurred. Please try again.');
+      const errMsg = 'An error occurred. Please say Suno to try again.';
+      _responseController.add(errMsg);
+      unawaited(TtsService.instance.speakImmediate(errMsg));
     } finally {
       if (_interactionId == currentInteraction) {
         _setState(Pipeline2State.awaitingWakeWord);
@@ -145,23 +176,78 @@ class ConversationCoordinator {
     }
   }
 
+  // ── Localised messages ────────────────────────────────────────────────
+
+  String _listeningMessage(String lang) {
+    switch (lang) {
+      case 'hi': return 'सुन रहा हूँ';
+      case 'ta': return 'கேட்கிறேன்';
+      case 'te': return 'వింటున్నాను';
+      case 'bn': return 'শুনছি';
+      case 'mr': return 'ऐकतो आहे';
+      case 'kn': return 'ಕೇಳುತ್ತಿದ್ದೇನೆ';
+      default:   return 'Listening';
+    }
+  }
+
+  String _emptyTranscriptMessage(String lang) {
+    switch (lang) {
+      case 'hi': return 'कुछ सुनाई नहीं दिया। Suno कहकर फिर पूछें।';
+      case 'ta': return 'ஒன்றும் கேட்கவில்லை. மீண்டும் Suno சொல்லுங்கள்.';
+      case 'te': return 'ఏమీ వినపడలేదు. మళ్ళీ Suno చెప్పండి.';
+      case 'bn': return 'কিছু শোনা যায়নি। আবার Suno বলুন।';
+      case 'mr': return 'काही ऐकू आले नाही. Suno म्हणून पुन्हा विचारा.';
+      case 'kn': return 'ಏನೂ ಕೇಳಿಸಲಿಲ್ಲ. ಮತ್ತೆ Suno ಹೇಳಿ.';
+      default:   return "I didn't catch that. Say Suno to try again.";
+    }
+  }
+
+  String _noResponseMessage(String lang) {
+    switch (lang) {
+      case 'hi': return 'कोई उत्तर नहीं मिला। कृपया फिर से प्रयास करें।';
+      case 'ta': return 'பதில் இல்லை. மீண்டும் முயற்சிக்கவும்.';
+      case 'te': return 'సమాధానం రాలేదు. మళ్ళీ ప్రయత్నించండి.';
+      case 'bn': return 'কোনো উত্তর নেই। আবার চেষ্টা করুন।';
+      case 'mr': return 'उत्तर नाही. कृपया पुन्हा प्रयत्न करा.';
+      case 'kn': return 'ಯಾವ ಉತ್ತರವೂ ಇಲ್ಲ. ದಯವಿಟ್ಟು ಮತ್ತೆ ಪ್ರಯತ್ನಿಸಿ.';
+      default:   return 'No response. Please try again.';
+    }
+  }
+
+  // ── Manual controls ───────────────────────────────────────────────────
+
   /// Cancel current AI response and stop TTS immediately.
   Future<void> cancelResponse() async {
     _interactionId++; // invalidates in-flight interaction
     await VlmRunner.instance.cancel();
     await StreamingTts.instance.stop();
+    unawaited(HapticService.instance.cancelPulse());
     _setState(Pipeline2State.awaitingWakeWord);
     _log.i('Response cancelled by user');
   }
 
   Future<void> triggerManually() async {
-    if (_state == Pipeline2State.awaitingWakeWord) {
-      await _onWakeWordDetected();
-    } else if (_state == Pipeline2State.speaking ||
-               _state == Pipeline2State.thinking ||
-               _state == Pipeline2State.transcribing) {
-      await cancelResponse();
-      await _onWakeWordDetected();
+    try {
+      if (_state == Pipeline2State.idle) {
+        // P2 hasn't started yet (e.g. start() is still in progress or failed).
+        // Start now and immediately begin listening.
+        await start();
+        await _onWakeWordDetected();
+      } else if (_state == Pipeline2State.awaitingWakeWord) {
+        await _onWakeWordDetected();
+      } else if (_state == Pipeline2State.speaking ||
+                 _state == Pipeline2State.thinking ||
+                 _state == Pipeline2State.transcribing) {
+        await cancelResponse();
+        await _onWakeWordDetected();
+      }
+      // recording state: user must tap stop (handled via stopManually)
+    } catch (e, stack) {
+      _log.e('triggerManually error: $e\n$stack');
+      const msg = 'Could not start recording. Please try again.';
+      _responseController.add(msg);
+      unawaited(TtsService.instance.speakImmediate(msg));
+      _setState(Pipeline2State.awaitingWakeWord);
     }
   }
 
@@ -192,4 +278,9 @@ class ConversationCoordinator {
     _responseController.close();
     _transcriptController.close();
   }
+}
+
+// ignore: nothing_returned
+void unawaited(Future<void> future) {
+  // Intentionally fire-and-forget for parallel execution.
 }

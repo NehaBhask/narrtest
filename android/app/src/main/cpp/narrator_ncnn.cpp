@@ -4,6 +4,12 @@
 #include <android/log.h>
 #include "ncnn/net.h"
 #include "ncnn/mat.h"
+// omp.h: included to allow explicit runtime suppression of OpenMP parallelism.
+// The prebuilt libncnn.a has 1230+ __kmpc_* references. Setting
+// omp_set_num_threads(1) + omp_set_dynamic(0) prevents __kmp_invoke_microtask
+// from ever spawning worker threads, eliminating SEGV_ACCERR on Snapdragon
+// 662 / Android 12 (stack overflow in the OpenMP worker thread stack).
+#include <omp.h>
 
 #define LOG_TAG "NarratorNCNN"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -126,7 +132,10 @@ static const bool IS_OBSTACLE[80] = {
 
 static ncnn::Net yoloNet;
 static bool      modelLoaded    = false;
-static const int INPUT_SIZE     = 320;
+// INPUT_SIZE 640: Must match the yolov8n.ncnn.param file's hardcoded reshape
+// dimensions (6400, 1600, 400). Reducing this to 320 causes a shape mismatch in
+// Reshape_arm::forward, resulting in out-of-bounds memory accesses and SIGSEGV.
+static const int INPUT_SIZE     = 640;
 
 // ── Tuned thresholds ──────────────────────────────────────────────────────────
 // CONF_THRESHOLD 0.65: raised from 0.50 — eliminates the vast majority of
@@ -154,9 +163,27 @@ Java_com_narrator_NarratorPlugin_nativeLoadModel(
     const char *bin   = env->GetStringUTFChars(binPath,   nullptr);
     LOGI("Loading model param=%s", param);
 
+    // ── Disable OpenMP parallelism at the runtime level ───────────────
+    // NCNN's opt.num_threads controls NCNN's thread pool, but the prebuilt
+    // libncnn.a still uses #pragma omp parallel in many kernels, which are
+    // dispatched by the LLVM libomp runtime independently of opt.num_threads.
+    // Calling these BEFORE model load ensures the runtime thread pool is
+    // configured to 1 thread from the very first inference.
+    omp_set_dynamic(0);        // disable dynamic thread count adjustment
+    omp_set_num_threads(1);    // force all OpenMP regions to run with 1 thread
+    LOGI("OpenMP: num_threads clamped to 1 (omp_get_max_threads=%d)",
+         omp_get_max_threads());
+
     yoloNet.opt.use_vulkan_compute = false;
-    yoloNet.opt.num_threads        = 4;
+    // num_threads = 1: Keep OpenMP thread count clamped to 1 for stability.
+    // The previous SIGSEGV_ACCERR in __kmp_invoke_microtask was caused by an out-of-bounds
+    // memory access in Reshape_arm::forward because INPUT_SIZE was set to 320, which
+    // mismatched the hardcoded shape parameters (6400, 1600, 400) in the 640x640 model.
+    yoloNet.opt.num_threads        = 1;
     yoloNet.opt.use_bf16_storage   = false;
+    yoloNet.opt.use_fp16_packed    = false;
+    yoloNet.opt.use_fp16_storage   = false;
+    yoloNet.opt.use_fp16_arithmetic= false;
 
     int ret = yoloNet.load_param(param);
     if (ret != 0) {
@@ -236,16 +263,37 @@ static std::vector<Detection> runInference(
 
     ncnn::Extractor ex = yoloNet.create_extractor();
     ex.set_light_mode(true);
-    ex.input("in0", in);
+    // Reaffirm omp_set_num_threads(1) immediately before inference in case
+    // another thread reset it (defensive — should not normally be needed).
+    omp_set_num_threads(1);
+    // num_threads is inherited from yoloNet.opt.num_threads (set to 1 during load).
 
+    // ── Input blob name: try both common NCNN export names ──────────────
+    // ultralytics export → 'images'
+    // older pnnx export  → 'in0'
+    int inRet = ex.input("images", in);
+    if (inRet != 0) {
+        inRet = ex.input("in0", in);
+        if (inRet != 0) {
+            LOGE("input failed — tried 'images' and 'in0'. ret=%d", inRet);
+            return {};
+        }
+    }
+
+    // ── Output blob name: try all known names ────────────────────────────
+    // 'output0'  — standard ultralytics pnnx export
+    // 'out0'     — older pnnx / Roboflow export (NCNN warns and suggests this)
+    // '377'      — some quantised exports use numeric blob names
     ncnn::Mat out;
-    // YOLOv8n NCNN export: try both common output node names
     int ret = ex.extract("output0", out);
     if (ret != 0 || out.empty()) {
         ret = ex.extract("out0", out);
     }
     if (ret != 0 || out.empty()) {
-        LOGE("extract failed — tried output0 and out0. ret=%d w=%d h=%d", ret, out.w, out.h);
+        ret = ex.extract("377", out);
+    }
+    if (ret != 0 || out.empty()) {
+        LOGE("extract failed — tried output0, out0, 377. ret=%d", ret);
         return {};
     }
 
@@ -266,6 +314,15 @@ static std::vector<Detection> runInference(
 
     if (num_classes != 80) {
         LOGE("Unexpected class count %d — model/param mismatch?", num_classes);
+        return {};
+    }
+
+    // ── Safety: verify Mat data pointer before iterating ────────────────
+    // If extract() returned 0 but the Mat is somehow corrupt, row() will
+    // return a null pointer and the loop will SIGSEGV. This guard prevents that.
+    if (out.data == nullptr || num_anchors <= 0 || num_feats < 5) {
+        LOGE("Mat sanity check failed: data=%p anchors=%d feats=%d",
+             out.data, num_anchors, num_feats);
         return {};
     }
 

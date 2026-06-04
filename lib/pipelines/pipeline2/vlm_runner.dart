@@ -5,6 +5,7 @@ import 'package:logger/logger.dart';
 import '../../core/constants.dart';
 import '../../core/model_manager.dart';
 import '../../core/dpdp_consent.dart';
+import '../../services/tts_service.dart';
 
 enum VlmTier { smolvlm256m, qwen3vl2b }
 enum VlmState { idle, loading, generating, done, error }
@@ -65,14 +66,21 @@ class VlmRunner {
   }
 
   /// Generate a response for the given frame and query.
-  /// Collects tokens from the native stream and returns the full text.
-  /// The caller (ConversationCoordinator) handles TTS streaming separately.
+  ///
+  /// Improvements over the original:
+  ///   • Hard timeout reduced from 20s → [AppConstants.maxVlmTimeoutSeconds] (12s)
+  ///   • First-token timeout: if no token arrives within
+  ///     [AppConstants.vlmFirstTokenTimeoutSeconds] (3s), speaks a reassurance
+  ///     message so the blind user knows the app is working.
   Future<String> generateResponse({
     required Uint8List frameJpeg,
     required String englishQuery,
     String responseLanguage = 'en',
   }) async {
-    if (_state == VlmState.loading) return 'Still loading the model, please wait.';
+    if (_state == VlmState.loading) {
+      await TtsService.instance.speakImmediate('Still loading the model, please wait.');
+      return 'Still loading the model, please wait.';
+    }
 
     _state = VlmState.generating;
     _cancelled = false;
@@ -90,12 +98,6 @@ class VlmRunner {
     };
     final langName = langNames[responseLanguage] ?? 'English';
 
-    // ── FIX: Instruct the model to respond in natural descriptive language ──
-    // SmolVLM was fine-tuned on VQA datasets that use a "Caption. Answer: Label"
-    // format for short questions — e.g. "Laptop. Answer: Computer."
-    // Prepending a narration instruction overrides this and produces a full
-    // natural sentence suitable for a visually impaired user.
-    // ────────────────────────────────────────────────────────────────────────
     const narratorInstruction =
         'You are a visual assistant helping a visually impaired person. '
         'Describe what you see in a single clear natural sentence. '
@@ -106,43 +108,66 @@ class VlmRunner {
         ? '$narratorInstruction\n\nQuestion: $englishQuery'
         : '$narratorInstruction\n\nQuestion: $englishQuery\n\n(Respond in $langName.)';
 
-    // Collect all tokens until sentinel '\x00', with a hard timeout
     final buffer = StringBuffer();
     final completer = Completer<String>();
     StreamSubscription? sub;
+    bool firstTokenReceived = false;
 
-    // Timeout guard — if native never sends '\x00', we don't hang forever
-    final timeout = Timer(const Duration(seconds: 20), () {
-      if (!completer.isCompleted) {
-        _log.w('VLM generation timeout — returning partial response');
-        sub?.cancel();
-        completer.complete(buffer.toString().trim());
-      }
-    });
+    // ── Hard timeout: [maxVlmTimeoutSeconds] seconds ────────────────────
+    final hardTimeout = Timer(
+      Duration(seconds: AppConstants.maxVlmTimeoutSeconds),
+      () {
+        if (!completer.isCompleted) {
+          _log.w('VLM hard timeout — returning partial response');
+          sub?.cancel();
+          completer.complete(buffer.toString().trim());
+        }
+      },
+    );
+
+    // ── First-token timeout: reassure the user if VLM is slow to start ──
+    // If no token arrives in [vlmFirstTokenTimeoutSeconds] seconds, the
+    // blind user has no feedback that anything is happening. Speak a brief
+    // "thinking" message to prevent confusion.
+    final firstTokenTimeout = Timer(
+      Duration(seconds: AppConstants.vlmFirstTokenTimeoutSeconds),
+      () {
+        if (!firstTokenReceived && !completer.isCompleted && !_cancelled) {
+          _log.d('VLM first-token timeout — speaking wait message');
+          TtsService.instance.speakImmediate(
+            _waitMessage(responseLanguage),
+          );
+        }
+      },
+    );
 
     sub = tokenStream.listen((token) {
       if (_cancelled) {
         sub?.cancel();
-        timeout.cancel();
+        hardTimeout.cancel();
+        firstTokenTimeout.cancel();
         if (!completer.isCompleted) completer.complete('');
         return;
       }
+      if (!firstTokenReceived) {
+        firstTokenReceived = true;
+        firstTokenTimeout.cancel(); // cancel wait message if tokens arrive fast
+      }
       if (token == '\x00') {
-        // End sentinel — generation complete
         sub?.cancel();
-        timeout.cancel();
+        hardTimeout.cancel();
         if (!completer.isCompleted) completer.complete(buffer.toString().trim());
       } else {
         buffer.write(token);
       }
     }, onError: (e) {
-      timeout.cancel();
+      hardTimeout.cancel();
+      firstTokenTimeout.cancel();
       if (!completer.isCompleted) completer.completeError(e);
     });
 
     try {
       // Fire the native call — tokens stream back via _handleNativeCall
-      // This call itself returns the full response too (used as fallback)
       final nativeResult = _channel.invokeMethod<String>('generateResponse', {
         'imageBytes': frameJpeg,
         'query': query,
@@ -160,11 +185,25 @@ class VlmRunner {
       _state = VlmState.done;
       return response;
     } catch (e) {
-      timeout.cancel();
+      hardTimeout.cancel();
+      firstTokenTimeout.cancel();
       sub?.cancel();
       _state = VlmState.error;
       _log.e('VLM inference error: $e');
       return 'Sorry, I could not process that. Please try again.';
+    }
+  }
+
+  /// Localised "still thinking" reassurance message.
+  String _waitMessage(String langCode) {
+    switch (langCode) {
+      case 'hi': return 'सोच रहा हूँ, एक पल...';
+      case 'ta': return 'யோசிக்கிறேன், ஒரு நிமிடம்...';
+      case 'te': return 'ఆలోచిస్తున్నాను, ఒక క్షణం...';
+      case 'bn': return 'ভাবছি, একটু অপেক্ষা করুন...';
+      case 'mr': return 'विचार करतोय, एक क्षण...';
+      case 'kn': return 'ಯೋಚಿಸುತ್ತಿದ್ದೇನೆ, ಒಂದು ಕ್ಷಣ...';
+      default:   return 'Thinking, one moment...';
     }
   }
 

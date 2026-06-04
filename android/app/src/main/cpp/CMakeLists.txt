@@ -47,6 +47,10 @@ target_link_libraries(narrator_ncnn
     machine_independent
     generic_code_gen
     os_dependent
+    # -fopenmp -static-openmp: required — libncnn.a has 1230+ OpenMP symbol
+    # references (__kmpc_fork_call, __kmpc_for_static_init etc.) that must
+    # be resolved at link time. Runtime parallelism is suppressed instead
+    # by calling omp_set_num_threads(1) + omp_set_dynamic(0) in narrator_ncnn.cpp.
     -fopenmp -static-openmp
     android
     log

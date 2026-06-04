@@ -89,9 +89,13 @@ class SttManager {
   }
 
   Future<String> _transcribeOnline(Uint8List pcm) async {
+    _log.i('Starting online STT transcribe: ${pcm.length} bytes');
     final prefs = await SharedPreferences.getInstance();
     final key = prefs.getString(AppConstants.groqApiKeyPrefKey) ?? '';
-    if (key.isEmpty) throw Exception('No Groq API key');
+    if (key.isEmpty) {
+      _log.i('No Groq API key configured');
+      throw Exception('No Groq API key');
+    }
     final wav = _pcmToWav(pcm, 16000, 1, 16);
     final lang = LanguageService.instance.currentCode;
     final form = FormData.fromMap({
@@ -100,31 +104,44 @@ class SttManager {
       'language': lang,
       'response_format': 'text',
     });
+    _log.i('Sending audio to Groq Whisper endpoint...');
     final resp = await _dio.post(
       '${AppConstants.groqApiBaseUrl}/audio/transcriptions',
       data: form,
       options: Options(headers: {'Authorization': 'Bearer $key'}),
     );
+    _log.i('Groq Whisper response received');
     return (resp.data as String).trim();
   }
 
   Future<String> _transcribeOffline(Uint8List pcm) async {
-    if (_offlineSession == null) await loadOfflineModel();
-    if (_offlineSession == null) return '[offline STT unavailable]';
+    _log.i('Starting offline STT transcribe: ${pcm.length} bytes');
+    if (_offlineSession == null) {
+      _log.i('Offline session is null, loading model...');
+      await loadOfflineModel();
+    }
+    if (_offlineSession == null) {
+      _log.e('Offline session failed to load, returning placeholder');
+      return '[offline STT unavailable]';
+    }
     final bd = ByteData.sublistView(pcm);
     final samples = Float32List(pcm.length ~/ 2);
     for (int i = 0; i < samples.length; i++) {
       samples[i] = bd.getInt16(i * 2, Endian.little) / 32768.0;
     }
+    _log.i('Prepared offline audio tensor of size ${samples.length}');
     final inputT = OrtValueTensor.createTensorWithDataList(samples, [1, samples.length]);
     final langT = OrtValueTensor.createTensorWithDataList(
         Int64List.fromList([_langId(LanguageService.instance.currentCode)]), [1]);
+    _log.i('Running offline Whisper session (runAsync)...');
     final outs = await _offlineSession!.runAsync(
         OrtRunOptions(), {'audio': inputT, 'language': langT}, ['output']);
+    _log.i('Offline Whisper session finished');
     inputT.release(); langT.release();
     final outputList = outs!;
     final tokens = outputList[0]?.value as List<dynamic>?;
     outputList[0]?.release();
+    _log.i('Offline Whisper returned ${tokens?.length} tokens');
     return tokens?.map((t) => t.toString()).join(' ') ?? '';
   }
 

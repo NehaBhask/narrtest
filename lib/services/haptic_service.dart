@@ -2,7 +2,14 @@ import 'package:vibration/vibration.dart';
 import 'package:logger/logger.dart';
 import '../core/constants.dart';
 
-/// Haptic feedback service — distinctive pulse pattern for obstacle alerts.
+/// Haptic feedback service — distinctive pulse patterns for each event type.
+///
+/// Patterns for blind users:
+///   obstacleAlert     — 2 sharp pulses (urgent, danger)
+///   listeningPulse    — 1 medium pulse (mic open, I am listening)
+///   readyPulse        — 2 gentle taps (system ready)
+///   responseComplete  — double-tap (answer finished)
+///   cancelPulse       — 1 short buzz (cancelled/stopped)
 class HapticService {
   HapticService._();
   static final HapticService instance = HapticService._();
@@ -17,22 +24,47 @@ class HapticService {
     _log.i('Vibrator: $_hasVibrator, AmplitudeControl: $_hasAmplitudeControl');
   }
 
-  /// Three-pulse pattern: distinguishable from system notifications.
+  /// Two-pulse pattern: urgent obstacle nearby.
+  /// Uses [AppConstants.obstaclePulsePattern] + matching intensities.
   Future<void> obstacleAlert() async {
     if (!_hasVibrator) return;
+    // obstaclePulsePattern has 5 entries: [0, 120, 80, 120, 0]
+    // obstaclePulseIntensities MUST also have 5 entries: [0, 220, 0, 220, 0]
     if (_hasAmplitudeControl) {
-      // intensities must match pattern length (7 entries: silence entries get 0)
       await Vibration.vibrate(
         pattern: AppConstants.obstaclePulsePattern,
-        intensities: [0, 200, 0, 200, 0, 200, 0],
+        intensities: AppConstants.obstaclePulseIntensities,
       );
     } else {
-      // Fallback: pattern only, no amplitude (works on all devices)
       await Vibration.vibrate(pattern: AppConstants.obstaclePulsePattern);
     }
   }
 
-  /// Single short pulse for wake word confirmation.
+  /// Single medium pulse: mic is now open and recording.
+  /// Gives the blind user tactile confirmation that the app is listening.
+  Future<void> listeningPulse() async {
+    if (!_hasVibrator) return;
+    if (_hasAmplitudeControl) {
+      await Vibration.vibrate(duration: 180, amplitude: 160);
+    } else {
+      await Vibration.vibrate(duration: 180);
+    }
+  }
+
+  /// Two gentle taps: system is initialised and ready.
+  Future<void> readyPulse() async {
+    if (!_hasVibrator) return;
+    if (_hasAmplitudeControl) {
+      await Vibration.vibrate(
+        pattern: [0, 60, 80, 60],
+        intensities: [0, 100, 0, 100],
+      );
+    } else {
+      await Vibration.vibrate(pattern: [0, 60, 80, 60]);
+    }
+  }
+
+  /// Single short buzz: wake word confirmation (lighter than listening).
   Future<void> wakeWordConfirm() async {
     if (!_hasVibrator) return;
     if (_hasAmplitudeControl) {
@@ -42,13 +74,26 @@ class HapticService {
     }
   }
 
-  /// Double pulse for end of P2 response.
+  /// Double-tap: P2 response has finished speaking.
   Future<void> responseComplete() async {
     if (!_hasVibrator) return;
     if (_hasAmplitudeControl) {
-      await Vibration.vibrate(pattern: [0, 60, 60, 60], intensities: [0, 150, 0, 150]);
+      await Vibration.vibrate(
+        pattern: [0, 60, 60, 60],
+        intensities: [0, 150, 0, 150],
+      );
     } else {
       await Vibration.vibrate(pattern: [0, 60, 60, 60]);
+    }
+  }
+
+  /// Single short buzz: action cancelled.
+  Future<void> cancelPulse() async {
+    if (!_hasVibrator) return;
+    if (_hasAmplitudeControl) {
+      await Vibration.vibrate(duration: 80, amplitude: 80);
+    } else {
+      await Vibration.vibrate(duration: 80);
     }
   }
 
