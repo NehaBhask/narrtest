@@ -47,7 +47,7 @@ class SttManager {
         ..setIntraOpNumThreads(2);
       _offlineSession = await OrtSession.fromFile(
           File(ModelManager.instance.modelPath(AppConstants.whisperTinyFile)), options);
-      _log.i('Offline STT loaded');
+      _log.i('Offline STT loaded. Inputs: ${_offlineSession?.inputNames}, Outputs: ${_offlineSession?.outputNames}');
     } catch (e) {
       _log.e('Offline STT load failed: $e');
     }
@@ -133,15 +133,16 @@ class SttManager {
     final inputT = OrtValueTensor.createTensorWithDataList(samples, [1, samples.length]);
     final langT = OrtValueTensor.createTensorWithDataList(
         Int64List.fromList([_langId(LanguageService.instance.currentCode)]), [1]);
-    _log.i('Running offline Whisper session (runAsync)...');
-    final outs = await _offlineSession!.runAsync(
+    _log.i('Running offline Whisper session (run)...');
+    final outs = _offlineSession!.run(
         OrtRunOptions(), {'audio': inputT, 'language': langT}, ['output']);
     _log.i('Offline Whisper session finished');
     inputT.release(); langT.release();
     final outputList = outs!;
     final tokens = outputList[0]?.value as List<dynamic>?;
     outputList[0]?.release();
-    _log.i('Offline Whisper returned ${tokens?.length} tokens');
+    _log.i('Offline Whisper returned ${tokens?.length} tokens. Type: ${tokens.runtimeType}');
+    _log.i('Tokens content: $tokens');
     return tokens?.map((t) => t.toString()).join(' ') ?? '';
   }
 

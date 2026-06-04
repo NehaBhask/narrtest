@@ -76,7 +76,7 @@ class TranslationEngine {
     final maskT = OrtValueTensor.createTensorWithDataList(
         attentionMask, [1, attentionMask.length]);
 
-    final outputs = await _session!.runAsync(
+    final outputs = _session!.run(
       OrtRunOptions(),
       {'input_ids': inputT, 'attention_mask': maskT},
       ['logits'],
