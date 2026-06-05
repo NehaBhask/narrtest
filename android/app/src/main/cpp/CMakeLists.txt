@@ -105,5 +105,15 @@ target_link_libraries(narrator_vlm PRIVATE
     android
     log
 )
+# ── Whisper mel spectrogram (native C++ for accuracy) ───────────────
+add_library(whisper_mel SHARED
+    whisper_mel.cpp
+)
+target_link_libraries(whisper_mel PRIVATE
+    android
+    log
+)
+target_compile_features(whisper_mel PRIVATE cxx_std_17)
+target_compile_options(whisper_mel PRIVATE -O3 -ffast-math)
 
 target_compile_features(narrator_vlm PRIVATE cxx_std_17)

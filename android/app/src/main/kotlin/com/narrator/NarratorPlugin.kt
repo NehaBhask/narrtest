@@ -21,6 +21,8 @@ class NarratorPlugin : FlutterPlugin, MethodCallHandler {
     private val scope = CoroutineScope(Dispatchers.IO)
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var inferJob: Job? = null
+    private var wakeWordManager: WakeWordManager? = null
+    private lateinit var wakeChannel: MethodChannel
     
     // Lock to prevent releasing the YOLO model while inference is ongoing (prevents OpenMP crashes)
     private val yoloLock = Any()
@@ -30,6 +32,8 @@ class NarratorPlugin : FlutterPlugin, MethodCallHandler {
     private external fun nativeDetectObjects(yuvData: ByteArray, width: Int, height: Int): FloatArray
     private external fun nativeDetectFromRgb(rgbData: ByteArray, width: Int, height: Int): FloatArray
     private external fun nativeReleaseModel()
+    // ── Mel spectrogram native declaration ───────────────────────────────────
+    private external fun computeMelSpectrogram(pcmSamples: FloatArray): FloatArray
 
     companion object {
         var nativeLibraryLoaded = false
@@ -39,9 +43,13 @@ class NarratorPlugin : FlutterPlugin, MethodCallHandler {
                 System.loadLibrary("narrator_ncnn")
                 nativeLibraryLoaded = true
                 android.util.Log.i("NarratorPlugin", "narrator_ncnn.so loaded successfully")
+                System.loadLibrary("whisper_mel") // Whisper mel from C++
+                android.util.Log.i("NarratorPlugin", "whisper_mel.so loaded successfully")
             } catch (e: UnsatisfiedLinkError) {
                 android.util.Log.e("NarratorPlugin",
                     "narrator_ncnn.so FAILED to load — YOLO will be disabled: ${e.message}")
+                android.util.Log.e("NarratorPlugin",
+                    "whisper_mel.so FAILED to load — Whisper STT will be disabled: ${e.message}")
             }
         }
     }
@@ -71,6 +79,8 @@ class NarratorPlugin : FlutterPlugin, MethodCallHandler {
 
         vlmChannel = MethodChannel(binding.binaryMessenger, "com.narrator/vlm_plugin")
         vlmChannel.setMethodCallHandler(this)
+        wakeChannel = MethodChannel(binding.binaryMessenger, "com.narrator/wake_word")
+        wakeChannel.setMethodCallHandler(this)
 
         VlmBridge.tokenCallback = { token ->
             mainHandler.post { vlmChannel.invokeMethod("onToken", token) }
@@ -81,6 +91,7 @@ class NarratorPlugin : FlutterPlugin, MethodCallHandler {
         ncnnChannel.setMethodCallHandler(null)
         vlmChannel.setMethodCallHandler(null)
         VlmBridge.tokenCallback = null
+        wakeChannel.setMethodCallHandler(null)
     }
 
     override fun onMethodCall(call: MethodCall, result: Result) {
@@ -238,6 +249,35 @@ class NarratorPlugin : FlutterPlugin, MethodCallHandler {
                 try { VlmBridge.release() } catch (_: Throwable) {}
                 result.success(null)
             }
+            "computeMelSpectrogram" -> {
+    val pcm = call.argument<FloatArray>("pcmSamples") ?: run {
+        result.error("INVALID_ARGS", "pcmSamples missing", null); return
+    }
+    scope.launch {
+        val mel = try {
+            computeMelSpectrogram(pcm)
+        } catch (t: Throwable) {
+            android.util.Log.e("NarratorPlugin", "computeMelSpectrogram: ${t.message}")
+            FloatArray(0)
+        }
+        mainHandler.post { result.success(mel.toList()) }
+    }
+}
+"startListening" -> {
+    wakeWordManager = WakeWordManager(context) { keyword ->
+        mainHandler.post {
+            wakeChannel.invokeMethod("onWakeWordDetected", keyword)
+        }
+    }
+    wakeWordManager?.start()
+    result.success(null)
+}
+
+"stopListening" -> {
+    wakeWordManager?.stop()
+    wakeWordManager = null
+    result.success(null)
+}
 
             else -> result.notImplemented()
         }

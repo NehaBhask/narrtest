@@ -12,6 +12,7 @@ dependency_overrides:
 dependencies:
   flutter:
     sdk: flutter
+  fftea: ^1.3.0
 
   # ── Camera ────────────────────────────────────────────────
   # 0.12.x uses AndroidSurfaceProducer API — works with Impeller/Vulkan.
@@ -80,9 +81,9 @@ flutter:
 
   assets:
     - assets/models/
-    - assets/wake_words/
     - assets/animations/
     - assets/i18n/
+    - assets/models/whisper_vocab.json
 
   # fonts:
   #   - family: Outfit

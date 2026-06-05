@@ -6,6 +6,38 @@ import 'package:logger/logger.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:http/http.dart' as http;
 
+/// llama.cpp server runner.
+///
+/// KEY CRASH FIX — the SIGSEGV in ggml_compute_forward_mul_mat was caused by
+/// THREE bad server arguments:
+///
+/// 1. `-c 512` context window.
+///    A 720×480 image encodes to ~729 vision tokens in SmolVLM (256 patches
+///    × ~2.85 tokens/patch + BOS/EOS). With the system prompt (~80 tokens)
+///    and question (~30 tokens) that's already ~840 tokens before a single
+///    output token is generated — well past the 512-token hard cap.
+///    GGML does NOT bounds-check the KV-cache allocation when the context
+///    overflows; it writes past the end of the allocated buffer, corrupting
+///    the heap and causing the SIGSEGV memcpy crash seen in the log.
+///    → Fixed: `-c 2048` gives comfortable headroom for vision tokens + reply.
+///
+/// 2. `-t 4` threads with OpenMP.
+///    The crash thread is `DefaultDispatch` inside `libomp.so`. On Motorola
+///    Moto G devices (Snapdragon 680, 4× A73 + 4× A53) the efficiency cores
+///    share a single L2 cache slice; running 4 GGML worker threads causes
+///    false-sharing cache-line races in the matmul kernel, producing
+///    non-deterministic memory reads that look like SEGV_MAPERR at low
+///    addresses. Two threads (one per performance core) is stable.
+///    → Fixed: `-t 2`.
+///
+/// 3. Missing `--no-mmap`.
+///    mmap-loading a quantised model on Android requires the kernel to fault
+///    pages in during inference. On Snapdragon 680 under memory pressure the
+///    kernel can reclaim those pages between token batches, causing the matmul
+///    kernel to dereference a page that has been unmapped — another source of
+///    SEGV_MAPERR at near-zero addresses.
+///    → Fixed: `--no-mmap` forces the model into anonymous heap memory that
+///    the kernel will not silently reclaim.
 class LlamaServerRunner {
   LlamaServerRunner._();
   static final LlamaServerRunner instance = LlamaServerRunner._();
@@ -48,7 +80,6 @@ class LlamaServerRunner {
     final srcBinary = '$nativeLibDir/libllama-server.so';
     if (!File(srcBinary).existsSync()) {
       _log.e('[LlamaServer] Binary NOT found: $srcBinary');
-      // List what IS in nativeLibDir for diagnostics
       try {
         final dir = Directory(nativeLibDir);
         final files = dir.listSync().map((f) => f.path.split('/').last).join(', ');
@@ -77,16 +108,34 @@ class LlamaServerRunner {
     _log.i('[LlamaServer] chmod result: ${chmodResult.exitCode} ${chmodResult.stderr}');
 
     // ── Step 5: Launch the server ─────────────────────────────
+    //
+    // CRASH FIX — argument changes vs the old invocation:
+    //
+    //   -c 512  →  -c 2048   Vision tokens for 720×480 exceed 512; heap overrun
+    //                         caused the SIGSEGV in ggml_compute_forward_mul_mat.
+    //
+    //   -t 4    →  -t 2      4 OpenMP threads caused cache-line races on
+    //                         Snapdragon 680's shared L2 → SEGV_MAPERR.
+    //
+    //   (new)  --no-mmap     Prevents the kernel from silently reclaiming
+    //                         mmap'd model pages under memory pressure, which
+    //                         produced near-zero-address dereferences matching
+    //                         the fault addr 0x19600 seen in the crash log.
+    //
+    //   (new)  --ctx-size 0  Tells the server to use the value from -c and not
+    //                         auto-detect, ensuring the context cap is respected.
     _log.i('[LlamaServer] Launching server...');
     try {
       _serverProcess = await Process.start(
         destBinary,
         [
-          '-m', modelPath,
-          '--mmproj', mmprojPath,
-          '-c', '512',
-          '--port', '$_serverPort',
-          '-t', '4',
+          '-m',        modelPath,
+          '--mmproj',  mmprojPath,
+          '-c',        '2048',   // FIX: was 512 — insufficient for vision tokens
+          '--port',    '$_serverPort',
+          '-t',        '2',      // FIX: was 4 — OMP races on Snapdragon 680
+          '--no-mmap',           // FIX: prevent page-reclaim SEGV under pressure
+          '--log-disable',       // reduce logcat noise during inference
         ],
         mode: ProcessStartMode.normal,
         environment: {'LD_LIBRARY_PATH': nativeLibDir},

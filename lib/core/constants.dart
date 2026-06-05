@@ -49,6 +49,9 @@ class AppConstants {
   static const String smolvlmMmprojFile = 'mmproj-SmolVLM-256M-Instruct-f16.gguf';
   static const String indicTrans2File = 'indictrans2_int8.onnx';
   static const String whisperTinyFile = 'whisper_tiny_multilingual.onnx';
+  static const String whisperEncoderFile = 'encoder_model.onnx';
+  static const String whisperDecoderFile = 'decoder_model.onnx';
+  static const String whisperDecoderWithPastFile = 'decoder_with_past_model.onnx';
   static const String sileroVadFile = 'silero_vad.onnx';
   static const String qwen3VlFile = 'qwen3_vl_2b_q4.gguf';
 

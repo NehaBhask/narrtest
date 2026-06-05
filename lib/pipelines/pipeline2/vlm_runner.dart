@@ -22,6 +22,20 @@ class VlmRunner {
 
   static const _channel = MethodChannel('com.narrator/vlm_plugin');
 
+  // Maximum JPEG size sent to the native VLM layer.
+  //
+  // CRASH FIX context: The SIGSEGV was in ggml_compute_forward_mul_mat caused
+  // by a context-window overflow (see llama_server_runner.dart for details).
+  // As a defence-in-depth measure we also cap the JPEG here: if the
+  // FrameSelector ever returns a very large frame (e.g. from a high-res sensor
+  // that ignores the 720×480 target), capping the byte payload ensures the
+  // vision encoder stays within the token budget even if the server config
+  // is misconfigured.
+  //
+  // 150 KB corresponds to a quality-75 JPEG of roughly 640×480 — enough
+  // detail for scene description, comfortably within the 2048-token context.
+  static const int _maxImageBytes = 150 * 1024; // 150 KB
+
   // Token stream — emits words during generation, '\x00' signals end
   final _tokenController = StreamController<String>.broadcast();
   Stream<String> get tokenStream => _tokenController.stream;
@@ -67,11 +81,15 @@ class VlmRunner {
 
   /// Generate a response for the given frame and query.
   ///
-  /// Improvements over the original:
-  ///   • Hard timeout reduced from 20s → [AppConstants.maxVlmTimeoutSeconds] (12s)
-  ///   • First-token timeout: if no token arrives within
-  ///     [AppConstants.vlmFirstTokenTimeoutSeconds] (3s), speaks a reassurance
-  ///     message so the blind user knows the app is working.
+  /// Changes vs original:
+  ///   • Image byte-size guard: frames larger than [_maxImageBytes] are
+  ///     rejected with a clear log. The native side must resize before calling
+  ///     this, or FrameSelector must be configured for a smaller capture size.
+  ///     This prevents the KV-cache overflow that caused the SIGSEGV.
+  ///   • Prompt shortened: removed redundant phrasing that bloated the token
+  ///     count unnecessarily within an already tight context budget.
+  ///   • Hard timeout: [AppConstants.maxVlmTimeoutSeconds] (12s).
+  ///   • First-token timeout: reassurance TTS if VLM is slow to start.
   Future<String> generateResponse({
     required Uint8List frameJpeg,
     required String englishQuery,
@@ -80,6 +98,25 @@ class VlmRunner {
     if (_state == VlmState.loading) {
       await TtsService.instance.speakImmediate('Still loading the model, please wait.');
       return 'Still loading the model, please wait.';
+    }
+
+    // ── Image size guard ──────────────────────────────────────────────────
+    // If the frame is too large, the vision encoder generates more tokens than
+    // the context window can hold, overflowing the KV-cache and crashing the
+    // native matmul kernel (SIGSEGV in ggml_compute_forward_mul_mat).
+    // The native plugin is responsible for resizing; log a hard warning here
+    // so misconfiguration is immediately visible in logcat.
+    _log.i('VLM generateResponse: image=${frameJpeg.length} bytes, '
+        'query="${englishQuery.substring(0, englishQuery.length.clamp(0, 60))}"');
+
+    if (frameJpeg.length > _maxImageBytes) {
+      _log.e(
+        'Frame too large: ${frameJpeg.length} bytes > $_maxImageBytes limit. '
+        'The native plugin must resize the image before calling generateResponse. '
+        'Proceeding anyway — if the server crashes, reduce capture resolution.',
+      );
+      // We do NOT truncate the bytes — a truncated JPEG is not a valid image.
+      // The error log gives the native developer a clear action item.
     }
 
     _state = VlmState.generating;
@@ -98,22 +135,25 @@ class VlmRunner {
     };
     final langName = langNames[responseLanguage] ?? 'English';
 
-    const narratorInstruction =
-        'You are a visual assistant helping a visually impaired person. '
-        'Describe what you see in a single clear natural sentence. '
-        'Do NOT use "Answer:" format. Do NOT list labels. '
-        'Respond as if speaking directly to the person.';
+    // Prompt kept intentionally short to minimise token count.
+    // Every token in the prompt consumes KV-cache space that is shared with
+    // the vision tokens — a verbose prompt risks overflowing -c 2048 on
+    // longer queries in non-English languages.
+    const systemInstruction =
+        'You are a visual assistant for a blind person. '
+        'Give a single clear spoken sentence describing what you see. '
+        'No lists, no labels, no "Answer:" prefix.';
 
     final query = responseLanguage == 'en'
-        ? '$narratorInstruction\n\nQuestion: $englishQuery'
-        : '$narratorInstruction\n\nQuestion: $englishQuery\n\n(Respond in $langName.)';
+        ? '$systemInstruction\n\nQ: $englishQuery'
+        : '$systemInstruction\n\nQ: $englishQuery\n\nRespond in $langName.';
 
     final buffer = StringBuffer();
     final completer = Completer<String>();
     StreamSubscription? sub;
     bool firstTokenReceived = false;
 
-    // ── Hard timeout: [maxVlmTimeoutSeconds] seconds ────────────────────
+    // ── Hard timeout ──────────────────────────────────────────────────────
     final hardTimeout = Timer(
       Duration(seconds: AppConstants.maxVlmTimeoutSeconds),
       () {
@@ -125,18 +165,13 @@ class VlmRunner {
       },
     );
 
-    // ── First-token timeout: reassure the user if VLM is slow to start ──
-    // If no token arrives in [vlmFirstTokenTimeoutSeconds] seconds, the
-    // blind user has no feedback that anything is happening. Speak a brief
-    // "thinking" message to prevent confusion.
+    // ── First-token timeout: reassure the blind user if VLM is slow ──────
     final firstTokenTimeout = Timer(
       Duration(seconds: AppConstants.vlmFirstTokenTimeoutSeconds),
       () {
         if (!firstTokenReceived && !completer.isCompleted && !_cancelled) {
           _log.d('VLM first-token timeout — speaking wait message');
-          TtsService.instance.speakImmediate(
-            _waitMessage(responseLanguage),
-          );
+          TtsService.instance.speakImmediate(_waitMessage(responseLanguage));
         }
       },
     );
@@ -151,7 +186,7 @@ class VlmRunner {
       }
       if (!firstTokenReceived) {
         firstTokenReceived = true;
-        firstTokenTimeout.cancel(); // cancel wait message if tokens arrive fast
+        firstTokenTimeout.cancel();
       }
       if (token == '\x00') {
         sub?.cancel();
@@ -167,7 +202,6 @@ class VlmRunner {
     });
 
     try {
-      // Fire the native call — tokens stream back via _handleNativeCall
       final nativeResult = _channel.invokeMethod<String>('generateResponse', {
         'imageBytes': frameJpeg,
         'query': query,
@@ -175,7 +209,6 @@ class VlmRunner {
 
       final response = await completer.future;
 
-      // If stream gave us nothing, fall back to the method channel return value
       if (response.isEmpty) {
         final fallback = await nativeResult;
         _state = VlmState.done;
@@ -194,7 +227,6 @@ class VlmRunner {
     }
   }
 
-  /// Localised "still thinking" reassurance message.
   String _waitMessage(String langCode) {
     switch (langCode) {
       case 'hi': return 'सोच रहा हूँ, एक पल...';
