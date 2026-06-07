@@ -1,125 +1,188 @@
+import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'constants.dart';
 
-/// Manages DPDP (Digital Personal Data Protection Act 2023) consent state.
-/// All consent decisions are stored locally only — never transmitted.
-class DpdpConsentManager {
-  DpdpConsentManager._();
-  static final DpdpConsentManager instance = DpdpConsentManager._();
-
-  SharedPreferences? _prefs;
-
-  Future<void> init() async {
-    _prefs = await SharedPreferences.getInstance();
-  }
-
-  // ── Core Consent ──────────────────────────────────────────────────────────
-
-  /// Returns true if the user has given valid, current consent.
-  bool hasConsented() {
-    final storedVersion = _prefs?.getString(AppConstants.privacyPolicyVersionKey);
-    final hasFlag = _prefs?.getBool(AppConstants.dpdpConsentKey) ?? false;
-    return hasFlag && storedVersion == AppConstants.privacyPolicyVersion;
-  }
-
-  /// Records the user's explicit consent with timestamp.
-  Future<void> recordConsent({
-    required bool onlineSttAllowed,
-    required bool analyticsAllowed,
-  }) async {
-    final now = DateTime.now().toIso8601String();
-    await _prefs?.setBool(AppConstants.dpdpConsentKey, true);
-    await _prefs?.setString(AppConstants.dpdpConsentTimestampKey, now);
-    await _prefs?.setString(
-        AppConstants.privacyPolicyVersionKey, AppConstants.privacyPolicyVersion);
-    await _prefs?.setBool(AppConstants.dpdpOnlineSttConsentKey, onlineSttAllowed);
-    await _prefs?.setBool(AppConstants.dpdpAnalyticsConsentKey, analyticsAllowed);
-  }
-
-  /// Revokes all consent and clears all local data.
-  Future<void> revokeConsent() async {
-    await _prefs?.clear();
-  }
-
-  // ── Granular Permissions ──────────────────────────────────────────────────
-
-  bool get onlineSttAllowed =>
-      _prefs?.getBool(AppConstants.dpdpOnlineSttConsentKey) ?? false;
-
-  bool get analyticsAllowed =>
-      _prefs?.getBool(AppConstants.dpdpAnalyticsConsentKey) ?? false;
-
-  Future<void> setOnlineSttConsent(bool value) async {
-    await _prefs?.setBool(AppConstants.dpdpOnlineSttConsentKey, value);
-  }
-
-  Future<void> setAnalyticsConsent(bool value) async {
-    await _prefs?.setBool(AppConstants.dpdpAnalyticsConsentKey, value);
-  }
-
-  // ── Audit Log (in-memory ring buffer, never persisted) ────────────────────
-
-  final List<DpdpAuditEvent> _auditLog = [];
-  static const int _maxAuditEvents = 50;
-
-  void logEvent(DpdpAuditEvent event) {
-    if (_auditLog.length >= _maxAuditEvents) {
-      _auditLog.removeAt(0);
-    }
-    _auditLog.add(event);
-  }
-
-  List<DpdpAuditEvent> get auditLog => List.unmodifiable(_auditLog);
-
-  void clearAuditLog() => _auditLog.clear();
-
-  // ── Consent Metadata ─────────────────────────────────────────────────────
-
-  String? get consentTimestamp =>
-      _prefs?.getString(AppConstants.dpdpConsentTimestampKey);
-
-  String get consentTimestampFormatted {
-    final ts = consentTimestamp;
-    if (ts == null) return 'Not consented';
-    final dt = DateTime.tryParse(ts);
-    if (dt == null) return ts;
-    return '${dt.day}/${dt.month}/${dt.year} ${dt.hour}:${dt.minute.toString().padLeft(2, '0')}';
-  }
+/// Processing event types logged for DPDP audit trail.
+enum ProcessingEvent {
+  cameraObstacleDetection,
+  cameraVlmInference,
+  audioWakeWord,
+  audioStt,
+  audioSttOnline,
+  translationOnDevice,
+  ttsOutput,
 }
 
-enum DpdpDataType {
-  cameraFrame,
-  audioCapture,
-  networkRequest,
-  modelInference,
-  userPreference,
-}
-
-class DpdpAuditEvent {
-  final DpdpDataType dataType;
-  final String description;
-  final bool stayedOnDevice;
+/// A single entry in the DPDP audit log.
+class AuditEntry {
   final DateTime timestamp;
+  final ProcessingEvent event;
+  final String detail;
 
-  const DpdpAuditEvent({
-    required this.dataType,
-    required this.description,
-    required this.stayedOnDevice,
+  const AuditEntry({
     required this.timestamp,
+    required this.event,
+    required this.detail,
   });
 
-  String get dataTypeLabel {
-    switch (dataType) {
-      case DpdpDataType.cameraFrame:
-        return 'Camera Frame';
-      case DpdpDataType.audioCapture:
-        return 'Audio Capture';
-      case DpdpDataType.networkRequest:
-        return 'Network Request';
-      case DpdpDataType.modelInference:
-        return 'Model Inference';
-      case DpdpDataType.userPreference:
-        return 'Preference';
+  Map<String, dynamic> toJson() => {
+    'ts':     timestamp.toIso8601String(),
+    'event':  event.name,
+    'detail': detail,
+  };
+
+  factory AuditEntry.fromJson(Map<String, dynamic> j) => AuditEntry(
+    timestamp: DateTime.parse(j['ts'] as String),
+    event:     ProcessingEvent.values.byName(j['event'] as String),
+    detail:    j['detail'] as String,
+  );
+}
+
+/// Consent state persisted to SharedPreferences.
+class ConsentState {
+  final bool baseConsentGiven;
+  final bool onlineSttConsented;
+  final bool analyticsConsented;
+  final bool isAdult;
+  final DateTime? consentTimestamp;
+  final String consentVersion;
+
+  const ConsentState({
+    this.baseConsentGiven   = false,
+    this.onlineSttConsented = false,
+    this.analyticsConsented = false,
+    this.isAdult            = false,
+    this.consentTimestamp,
+    this.consentVersion     = PrivacyConfig.consentVersion,
+  });
+
+  bool get isValid =>
+      baseConsentGiven && isAdult && consentTimestamp != null;
+
+  ConsentState copyWith({
+    bool? baseConsentGiven,
+    bool? onlineSttConsented,
+    bool? analyticsConsented,
+    bool? isAdult,
+    DateTime? consentTimestamp,
+    String? consentVersion,
+  }) => ConsentState(
+    baseConsentGiven:   baseConsentGiven   ?? this.baseConsentGiven,
+    onlineSttConsented: onlineSttConsented ?? this.onlineSttConsented,
+    analyticsConsented: analyticsConsented ?? this.analyticsConsented,
+    isAdult:            isAdult            ?? this.isAdult,
+    consentTimestamp:   consentTimestamp   ?? this.consentTimestamp,
+    consentVersion:     consentVersion     ?? this.consentVersion,
+  );
+
+  Map<String, dynamic> toJson() => {
+    'baseConsentGiven':   baseConsentGiven,
+    'onlineSttConsented': onlineSttConsented,
+    'analyticsConsented': analyticsConsented,
+    'isAdult':            isAdult,
+    'consentTimestamp':   consentTimestamp?.toIso8601String(),
+    'consentVersion':     consentVersion,
+  };
+
+  factory ConsentState.fromJson(Map<String, dynamic> j) => ConsentState(
+    baseConsentGiven:   j['baseConsentGiven']   as bool? ?? false,
+    onlineSttConsented: j['onlineSttConsented'] as bool? ?? false,
+    analyticsConsented: j['analyticsConsented'] as bool? ?? false,
+    isAdult:            j['isAdult']            as bool? ?? false,
+    consentTimestamp:   j['consentTimestamp'] != null
+        ? DateTime.tryParse(j['consentTimestamp'] as String)
+        : null,
+    consentVersion: j['consentVersion'] as String? ?? PrivacyConfig.consentVersion,
+  );
+}
+
+/// Manages DPDP Act 2023 consent and audit logging.
+///
+/// All data processing must be gated behind [isConsentValid].
+class DpdpConsentManager {
+  static const _consentKey  = 'narrator_consent_v1';
+  static const _auditLogKey = 'narrator_audit_log';
+
+  final SharedPreferences _prefs;
+
+  DpdpConsentManager(this._prefs);
+
+  // ── Consent ─────────────────────────────────────────────────────────────
+
+  ConsentState getConsent() {
+    final raw = _prefs.getString(_consentKey);
+    if (raw == null) return const ConsentState();
+    try {
+      return ConsentState.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+    } catch (_) {
+      return const ConsentState();
     }
   }
+
+  Future<void> saveConsent(ConsentState state) async {
+    await _prefs.setString(_consentKey, jsonEncode(state.toJson()));
+  }
+
+  bool get isConsentValid => getConsent().isValid;
+
+  /// Grant base consent (called from consent screen).
+  Future<void> grantConsent({
+    required bool onlineStt,
+    required bool analytics,
+    required bool isAdult,
+  }) async {
+    await saveConsent(ConsentState(
+      baseConsentGiven:   true,
+      onlineSttConsented: onlineStt,
+      analyticsConsented: analytics,
+      isAdult:            isAdult,
+      consentTimestamp:   DateTime.now(),
+      consentVersion:     PrivacyConfig.consentVersion,
+    ));
+    await logEvent(ProcessingEvent.cameraObstacleDetection, 'consent_granted');
+  }
+
+  /// Revoke all consent and delete all preferences (Right to Erasure).
+  Future<void> revokeConsent() async {
+    await _prefs.remove(_consentKey);
+    await _prefs.remove(_auditLogKey);
+  }
+
+  // ── Audit log ────────────────────────────────────────────────────────────
+
+  List<AuditEntry> getAuditLog() {
+    final raw = _prefs.getString(_auditLogKey);
+    if (raw == null) return [];
+    try {
+      final list = jsonDecode(raw) as List<dynamic>;
+      return list
+          .map((e) => AuditEntry.fromJson(e as Map<String, dynamic>))
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> logEvent(ProcessingEvent event, String detail) async {
+    final entries = getAuditLog();
+    entries.add(AuditEntry(
+      timestamp: DateTime.now(),
+      event:     event,
+      detail:    detail,
+    ));
+
+    // Trim to max entries (FIFO)
+    final trimmed = entries.length > PrivacyConfig.auditLogMaxEntries
+        ? entries.sublist(entries.length - PrivacyConfig.auditLogMaxEntries)
+        : entries;
+
+    await _prefs.setString(
+      _auditLogKey,
+      jsonEncode(trimmed.map((e) => e.toJson()).toList()),
+    );
+  }
+
+  /// Returns all unique processing event types seen in the audit log.
+  Set<ProcessingEvent> getProcessingEventTypes() =>
+      getAuditLog().map((e) => e.event).toSet();
 }
