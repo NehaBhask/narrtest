@@ -5,11 +5,8 @@ import '../../core/model_manager.dart';
 import '../../core/constants.dart';
 import 'dart:io';
 
-// ── COCO 80-Class Names ───────────────────────────────────────────────────────
-// Alias to AppConstants for easy access throughout this file.
-// Index MUST match the NCNN-exported YOLOv8n COCO model label order.
-// To verify your model's label order, check the .param file's output layer
-// or run: yolo predict model=yolov8n.pt source=your_image.jpg
+// ── COCO 80-Class Names ────────────────────────────────────────────────────
+// Index MUST match the NCNN-exported YOLOv8n COCO label order.
 List<String> get _cocoNames => AppConstants.cocoClassNames;
 
 class YoloDetection {
@@ -26,7 +23,6 @@ class YoloDetection {
     required this.y2,
   });
 
-  /// Human-readable COCO class name e.g. "person", "car", "chair"
   String get className =>
       (classId >= 0 && classId < _cocoNames.length)
           ? _cocoNames[classId]
@@ -88,9 +84,8 @@ class YoloNcnnRunner {
         'binPath':   binPath,
       });
       _isLoaded = result ?? false;
-      _log.i('YOLOv8 COCO model loaded: $_isLoaded  '
-          '(${_cocoNames.length} classes, '
-          '${AppConstants.navigationRelevantClassIds.length} nav-relevant)');
+      _log.i('YOLOv8 COCO model loaded: $_isLoaded '
+          '(${_cocoNames.length} classes)');
       return _isLoaded;
     } catch (e) {
       _log.e('Error loading YOLO model: $e');
@@ -119,6 +114,33 @@ class YoloNcnnRunner {
     );
   }
 
+  // ── Result parsing ─────────────────────────────────────────────────────────
+  //
+  // The JNI side returns a flat List<double> in groups of 6:
+  //   [classId, confidence, x1, y1, x2, y2, classId, confidence, ...]
+  //
+  // Filtering strategy:
+  //   • We apply a GLOBAL minimum confidence of 0.20 here to discard clearly
+  //     garbage detections before they reach ObstacleDetector. Per-class
+  //     thresholds are enforced in ObstacleDetector._passesConfidence().
+  //   • NMS is applied in two passes:
+  //       Pass 1 (same-class): standard greedy per-class NMS.
+  //       Pass 2 (cross-class): suppress heavily-overlapping boxes of
+  //         DIFFERENT classes, keeping the higher-confidence one. This handles
+  //         the case where YOLO fires both "person" and "bicycle" on a cyclist,
+  //         or "car" and "truck" on the same vehicle. Without this, the blind
+  //         user hears two alerts for one physical object.
+  //
+  // NMS IoU thresholds:
+  //   Same-class:  0.45 — fairly aggressive, YOLO already handles most same-
+  //                        class NMS internally; this is a safety net.
+  //   Cross-class: 0.60 — less aggressive; only suppress when boxes are nearly
+  //                        identical (genuine duplicate label, not two objects).
+
+  static const _globalMinConf      = 0.20;
+  static const _nmsIouSameClass    = 0.45;
+  static const _nmsIouCrossClass   = 0.60;
+
   List<YoloDetection> _parseResult(List<dynamic>? raw) {
     if (raw == null || raw.isEmpty) return [];
 
@@ -132,21 +154,23 @@ class YoloNcnnRunner {
       final x2         = (raw[i + 4] as num).toDouble();
       final y2         = (raw[i + 5] as num).toDouble();
 
-      // ── Guard 1: valid COCO class ID (0–79)
+      // Guard 1: valid COCO class ID (0–79)
       if (classId < 0 || classId >= _cocoNames.length) {
         _log.w('_parseResult: skipping out-of-range classId=$classId');
         continue;
       }
 
-      // ── Guard 2: confidence threshold — suppress ghost boxes
-      if (confidence < AppConstants.minConfidenceThreshold) {
-        _log.d('_parseResult: skipping low-confidence '
-            'classId=$classId conf=${confidence.toStringAsFixed(2)}');
-        continue;
-      }
+      // Guard 2: global floor confidence — catches garbage boxes from
+      // the blob-name mismatch bug (out0 vs output0) which produces
+      // near-zero confidence detections.
+      if (confidence < _globalMinConf) continue;
 
-      // ── Guard 3: degenerate bounding box
+      // Guard 3: degenerate bounding box
       if (x2 <= x1 || y2 <= y1) continue;
+
+      // Guard 4: minimum area — discard single-pixel noise boxes
+      final area = (x2 - x1) * (y2 - y1);
+      if (area < 0.0004) continue; // < 0.04 % of frame
 
       rawDetections.add(YoloDetection(
         classId:    classId,
@@ -155,26 +179,30 @@ class YoloNcnnRunner {
       ));
     }
 
-    // ── Sort by confidence descending before NMS
+    // Sort by confidence descending before NMS
     rawDetections.sort((a, b) => b.confidence.compareTo(a.confidence));
 
-    // ── Dart-side NMS: suppress overlapping boxes of the same class
-    final detections = _applyNms(rawDetections);
+    // Pass 1: same-class NMS
+    final afterPass1 = _nms(rawDetections, _nmsIouSameClass, sameClassOnly: true);
 
-    _log.d('_parseResult: ${detections.length} detections after NMS '
-        '(raw=${raw.length ~/ 6} packets, '
-        'minConf=${AppConstants.minConfidenceThreshold})');
+    // Pass 2: cross-class NMS (remove duplicate-label overlaps)
+    final detections = _nms(afterPass1, _nmsIouCrossClass, sameClassOnly: false);
+
+    _log.d('_parseResult: ${detections.length} detections after 2-pass NMS '
+        '(raw=${raw.length ~/ 6} packets)');
     return detections;
   }
 
-  /// Non-Maximum Suppression — removes duplicate overlapping boxes.
+  /// Greedy NMS.
   ///
-  /// Algorithm: greedy NMS per class.
-  ///   1. Sort by confidence (already done before calling).
-  ///   2. For each box, suppress any lower-confidence box of the same class
-  ///      whose IoU with the current box exceeds [AppConstants.nmsIouThreshold].
-  List<YoloDetection> _applyNms(List<YoloDetection> sorted) {
-    final kept = <YoloDetection>[];
+  /// [sameClassOnly] = true  → suppress only same-class overlaps (Pass 1)
+  /// [sameClassOnly] = false → suppress any class overlap (Pass 2)
+  List<YoloDetection> _nms(
+    List<YoloDetection> sorted,
+    double iouThreshold, {
+    required bool sameClassOnly,
+  }) {
+    final kept       = <YoloDetection>[];
     final suppressed = List<bool>.filled(sorted.length, false);
 
     for (int i = 0; i < sorted.length; i++) {
@@ -182,9 +210,8 @@ class YoloNcnnRunner {
       kept.add(sorted[i]);
       for (int j = i + 1; j < sorted.length; j++) {
         if (suppressed[j]) continue;
-        // Only suppress same-class boxes
-        if (sorted[j].classId != sorted[i].classId) continue;
-        if (_iou(sorted[i], sorted[j]) > AppConstants.nmsIouThreshold) {
+        if (sameClassOnly && sorted[j].classId != sorted[i].classId) continue;
+        if (_iou(sorted[i], sorted[j]) > iouThreshold) {
           suppressed[j] = true;
         }
       }
@@ -192,7 +219,7 @@ class YoloNcnnRunner {
     return kept;
   }
 
-  /// Intersection over Union for two bounding boxes.
+  /// Intersection over Union.
   double _iou(YoloDetection a, YoloDetection b) {
     final ix1 = a.x1 > b.x1 ? a.x1 : b.x1;
     final iy1 = a.y1 > b.y1 ? a.y1 : b.y1;

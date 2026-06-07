@@ -135,13 +135,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   String _readyMessage(String lang) {
     switch (lang) {
-      case 'hi': return 'Narrator तैयार है। कुछ पूछने के लिए Suno कहें।';
-      case 'ta': return 'Narrator தயார். கேட்க Suno சொல்லுங்கள்.';
-      case 'te': return 'Narrator సిద్ధంగా ఉంది. అడగడానికి Suno చెప్పండి.';
-      case 'bn': return 'Narrator প্রস্তুত। জিজ্ঞেস করতে Suno বলুন।';
-      case 'mr': return 'Narrator तयार आहे। विचारण्यासाठी Suno म्हणा.';
-      case 'kn': return 'Narrator ಸಿದ್ಧವಾಗಿದೆ. ಕೇಳಲು Suno ಹೇಳಿ.';
-      default:   return 'Narrator is ready. Say Suno to ask a question.';
+      case 'hi': return 'Narrator तैयार है। कुछ पूछने के लिए Narrator कहें।';
+      case 'ta': return 'Narrator தயார். கேட்க Narrator சொல்லுங்கள்.';
+      case 'te': return 'Narrator సిద్ధంగా ఉంది. అడగడానికి Narrator చెప్పండి.';
+      case 'bn': return 'Narrator প্রস্তুত। জিজ্ঞেস করতে Narrator বলুন।';
+      case 'mr': return 'Narrator तयार आहे। विचारण्यासाठी Narrator म्हणा.';
+      case 'kn': return 'Narrator ಸಿದ್ಧವಾಗಿದೆ. ಕೇಳಲು Narrator ಹೇಳಿ.';
+      default:   return 'Narrator is ready. Say Narrator to ask a question.';
     }
   }
 
@@ -247,8 +247,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         break;
       case Pipeline2State.awaitingWakeWord:
         msg = lang == 'hi'
-            ? 'तैयार हूँ। Suno कहें।'
-            : 'Ready. Say Suno to ask.';
+            ? 'तैयार हूँ। Narrator कहें।'
+            : 'Ready. Say Narrator to ask.';
         break;
       default:
         msg = 'Narrator ready';
@@ -483,7 +483,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       : p2State == Pipeline2State.transcribing ? 'Transcribing...'
                       : p2State == Pipeline2State.thinking ? 'Thinking...'
                       : p2State == Pipeline2State.speaking ? 'Speaking...'
-                      : 'Tap or say Suno',
+                      : 'Tap or say Narrator',
                   style: const TextStyle(color: Colors.white54, fontSize: 12)),
               ),
             ]),

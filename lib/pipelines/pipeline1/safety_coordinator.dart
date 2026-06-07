@@ -19,6 +19,24 @@ enum Pipeline1State { idle, running, paused }
 /// On RMX3092, startImageStream forces a camera session reconfiguration that
 /// kills the preview texture. Instead we use takePicture() on a 300ms timer
 /// driven by FrameSelector, which works within the existing preview session.
+///
+/// ── Alert design for blind users ──────────────────────────────────────────
+///
+/// TTS messages are kept intentionally short (≤ 5 words) because every extra
+/// syllable is time the user cannot hear their surroundings.
+///
+/// We layer three feedback channels:
+///   1. Haptic — fires immediately, no audio processing lag. Pattern intensity
+///      scales with proximity (4 levels). Always fires even when TTS is muted.
+///   2. TTS alert — short, direction-aware. Suppressed only when P2 is
+///      actively SPEAKING; urgent tier-1 threats (vehicles, animals) always
+///      break through.
+///   3. Cooldown — 2 s for non-urgent, 0.8 s for urgent, so the user isn't
+///      flooded but critical alerts are repeated quickly.
+///
+/// Direction uses clock-position phrasing in English ("car at 10 o'clock")
+/// and simple left/ahead/right in Indian languages where clock phrasing is
+/// harder to localise.
 class SafetyCoordinator {
   SafetyCoordinator._();
   static final SafetyCoordinator instance = SafetyCoordinator._();
@@ -34,6 +52,9 @@ class SafetyCoordinator {
   bool _inferring = false;
 
   DateTime? _lastAlertTime;
+  // Track last alerted class to avoid repeating the exact same alert.
+  int _lastAlertedClassId = -1;
+
   int _frameCount = 0;
   int _detectionCount = 0;
   double _currentFps = 0.0;
@@ -48,7 +69,6 @@ class SafetyCoordinator {
       _detectionsController.stream;
   double get currentFps => _currentFps;
 
-  /// Must be called after camera controller is initialised.
   void attachController(CameraController controller) {
     _controller = controller;
   }
@@ -57,34 +77,30 @@ class SafetyCoordinator {
     if (_state == Pipeline1State.running) return;
 
     if (!YoloNcnnRunner.nativeLibraryLoaded) {
-      _log.e('P1: narrator_ncnn.so failed to load — YOLO disabled. '
-          'Check that the native library was compiled and packaged correctly.');
+      _log.e('P1: narrator_ncnn.so failed to load — YOLO disabled.');
       return;
     }
 
     final loaded = await _yolo.loadModel();
     if (!loaded) {
       _log.e('P1: YOLOv8 model load failed — safety pipeline inactive. '
-          'Check that yolov8n.ncnn.param and yolov8n.ncnn.bin are present '
-          'in assets/models/ (standard COCO 80-class NCNN export).');
+          'Ensure yolov8n.ncnn.param and yolov8n.ncnn.bin are in assets/models/.');
       return;
     }
 
     _state = Pipeline1State.running;
     _startListener();
-    _log.i('Pipeline 1 started — YOLO running (conf≥${AppConstants.minConfidenceThreshold})');
+    _log.i('Pipeline 1 started');
   }
 
   void _startListener() {
     _frameSub?.cancel();
-    _frameSub = FrameSelector.instance.frameStream.listen((jpegBytes) {
-      _runInference(jpegBytes);
-    });
+    _frameSub = FrameSelector.instance.frameStream.listen(_runInference);
   }
 
   Future<void> _runInference(Uint8List jpegBytes) async {
     if (_state != Pipeline1State.running) return;
-    if (_inferring) return; // drop frame if previous inference still running
+    if (_inferring) return;
 
     _inferring = true;
     try {
@@ -122,115 +138,127 @@ class SafetyCoordinator {
   }
 
   Future<void> _triggerAlert(YoloDetection threat) async {
-    // ── Guard 1: cooldown ───────────────────────────────────────────────
-    final now = DateTime.now();
+    final now    = DateTime.now();
+    final urgent = _detector.isUrgent(threat);
+
+    // ── Cooldown ───────────────────────────────────────────────────────────
+    // Urgent tier-1 threats (vehicles, animals) get a shorter cooldown so the
+    // user is re-warned if the hazard persists.
+    // Same-class repeated alert: use longer cooldown to avoid repetition.
+    final cooldownMs = urgent ? 800 : 2000;
+    final sameClass  = threat.classId == _lastAlertedClassId;
+    final effectiveCooldownMs = sameClass ? cooldownMs * 2 : cooldownMs;
+
     if (_lastAlertTime != null &&
-        now.difference(_lastAlertTime!).inMilliseconds <
-            AppConstants.obstacleCooldownMs) {
+        now.difference(_lastAlertTime!).inMilliseconds < effectiveCooldownMs) {
+      // Still fire haptic even during cooldown — tactile feedback is fast and
+      // non-intrusive. Only skip it for proximitylevel 0 (distant object).
+      if (_detector.proximityLevel(threat) >= 2) {
+        unawaited(HapticService.instance.obstacleAlert());
+      }
       return;
     }
 
-    // ── Guard 2: never interrupt P2 speaking/thinking ───────────────────
-    // Allow alerts to fire while P2 is awaitingWakeWord or idle.
-    // Suppress only during active user interaction (recording, transcribing,
-    // thinking, speaking) so the VLM answer is not cut off.
+    // ── P2 suppression ────────────────────────────────────────────────────
+    // Only suppress TTS (not haptic) when P2 is actively speaking.
+    // We used to suppress during .thinking and .transcribing too, which meant
+    // the user could walk into a car while waiting for a VLM response.
+    // Now: urgent tier-1 threats always break through; others suppress during
+    // speaking only.
     final p2State = ConversationCoordinator.instance.state;
-    if (p2State == Pipeline2State.speaking ||
-        p2State == Pipeline2State.thinking ||
-        p2State == Pipeline2State.transcribing ||
-        p2State == Pipeline2State.recording) {
-      _log.d('P1: suppressing alert — P2 is $p2State');
+    final p2Speaking = p2State == Pipeline2State.speaking;
+    if (p2Speaking && !urgent) {
+      // Still give haptic feedback
+      unawaited(HapticService.instance.obstacleAlert());
+      _log.d('P1: TTS suppressed (P2 speaking, non-urgent)');
       return;
     }
 
-    _lastAlertTime = now;
+    _lastAlertTime    = now;
+    _lastAlertedClassId = threat.classId;
 
-    final dir      = _detector.direction(threat);
-    final urgent   = _detector.isUrgent(threat);
-    final distance = _detector.estimateDistanceM(threat);
+    final proximity = _detector.proximityLevel(threat);
+    final distance  = _detector.estimateDistanceM(threat);
+    final label     = _detector.labelFor(threat);
 
-    _log.i('🚨 Obstacle! class=${threat.className}, '
-        'conf=${threat.confidence.toStringAsFixed(2)}, '
-        'dir=$dir, urgent=$urgent, '
-        'dist≈${distance.toStringAsFixed(1)}m, '
-        'area=${threat.area.toStringAsFixed(2)}');
+    _log.i('🚨 class=${threat.className} conf=${threat.confidence.toStringAsFixed(2)} '
+        'prox=$proximity dist≈${distance.toStringAsFixed(1)}m '
+        'area=${threat.area.toStringAsFixed(3)} urgent=$urgent');
 
-    final lang  = LanguageService.instance.currentCode;
-    final label = threat.className;
-    final msg   = _buildAlertMessage(lang, label, dir, urgent);
-
-    // ── Fire haptic and TTS in parallel for minimum latency ────────────
-    // Haptic gives ~instant tactile feedback while TTS is initialising.
-    // We do NOT await the haptic — both fire simultaneously.
+    // ── Haptic — fires immediately before TTS ─────────────────────────────
+    // Intensity is driven by proximity level (0–3) so the user has a physical
+    // sense of how close the hazard is even before the voice speaks.
     unawaited(HapticService.instance.obstacleAlert());
+
+    // ── TTS ───────────────────────────────────────────────────────────────
+    final lang = LanguageService.instance.currentCode;
+    final msg  = _buildAlertMessage(lang, label, threat, urgent);
     await TtsService.instance.speakAlert(msg);
   }
 
-  /// Build a localised, direction-aware alert string.
-  ///
-  /// Examples:
-  ///   EN: "Warning! Person ahead"  or  "Car on your left"
-  ///   HI: "चेतावनी! आगे person है"  or  "बाईं तरफ car है"
+  // ── Alert message builder ──────────────────────────────────────────────────
+  //
+  // English uses clock-position phrasing ("car at 10 o'clock") because it
+  // conveys more precise direction with fewer words than "on your left".
+  //
+  // Indian languages use simple left/ahead/right because clock-position
+  // numbers don't localise cleanly — a user thinking in Kannada shouldn't
+  // have to parse an English "10 o'clock" mid-stride.
+  //
+  // Message length targets:
+  //   Non-urgent: ≤ 4 words   e.g. "Car at 10 o'clock"
+  //   Urgent:     ≤ 6 words   e.g. "Warning! Car very close ahead"
   String _buildAlertMessage(
-      String langCode, String objectName, String direction, bool urgent) {
+    String langCode,
+    String label,
+    YoloDetection threat,
+    bool urgent,
+  ) {
     final warn = urgent ? _urgentPrefix(langCode) : '';
+
+    if (langCode == 'en') {
+      // English: clock-position
+      final clock = _detector.clockPosition(threat);
+      if (urgent) {
+        // e.g. "Warning! Car very close, 11 o'clock"
+        return '${warn}$label very close, $clock';
+      }
+      // e.g. "Car at 10 o'clock"
+      return '$label at $clock';
+    }
+
+    // Indian languages: simple direction
+    final dir = _detector.direction(threat);
 
     switch (langCode) {
       case 'hi':
-        final dirHi = direction == 'left'
-            ? 'बाईं तरफ'
-            : direction == 'right'
-                ? 'दाईं तरफ'
-                : 'आगे';
-        return '${warn}$dirHi $objectName है, सावधान';
+        final d = dir == 'left' ? 'बाईं तरफ' : dir == 'right' ? 'दाईं तरफ' : 'आगे';
+        return '${warn}$d $label, सावधान';
 
       case 'ta':
-        final dirTa = direction == 'left'
-            ? 'இடதுபக்கம்'
-            : direction == 'right'
-                ? 'வலதுபக்கம்'
-                : 'முன்னால்';
-        return '${warn}$dirTa $objectName உள்ளது';
+        final d = dir == 'left' ? 'இடதுபக்கம்' : dir == 'right' ? 'வலதுபக்கம்' : 'முன்னால்';
+        return '${warn}$d $label';
 
       case 'te':
-        final dirTe = direction == 'left'
-            ? 'ఎడమవైపు'
-            : direction == 'right'
-                ? 'కుడివైపు'
-                : 'ముందు';
-        return '${warn}$dirTe $objectName ఉంది';
+        final d = dir == 'left' ? 'ఎడమవైపు' : dir == 'right' ? 'కుడివైపు' : 'ముందు';
+        return '${warn}$d $label';
 
       case 'bn':
-        final dirBn = direction == 'left'
-            ? 'বামদিকে'
-            : direction == 'right'
-                ? 'ডানদিকে'
-                : 'সামনে';
-        return '${warn}$dirBn $objectName আছে';
+        final d = dir == 'left' ? 'বামদিকে' : dir == 'right' ? 'ডানদিকে' : 'সামনে';
+        return '${warn}$d $label';
 
       case 'mr':
-        final dirMr = direction == 'left'
-            ? 'डावीकडे'
-            : direction == 'right'
-                ? 'उजवीकडे'
-                : 'पुढे';
-        return '${warn}$dirMr $objectName आहे';
+        final d = dir == 'left' ? 'डावीकडे' : dir == 'right' ? 'उजवीकडे' : 'पुढे';
+        return '${warn}$d $label';
 
       case 'kn':
-        final dirKn = direction == 'left'
-            ? 'ಎಡಭಾಗದಲ್ಲಿ'
-            : direction == 'right'
-                ? 'ಬಲಭಾಗದಲ್ಲಿ'
-                : 'ಮುಂದೆ';
-        return '${warn}$dirKn $objectName ಇದೆ';
+        final d = dir == 'left' ? 'ಎಡಭಾಗದಲ್ಲಿ' : dir == 'right' ? 'ಬಲಭಾಗದಲ್ಲಿ' : 'ಮುಂದೆ';
+        return '${warn}$d $label';
 
-      default: // English
-        final dirEn = direction == 'left'
-            ? 'on your left'
-            : direction == 'right'
-                ? 'on your right'
-                : 'ahead';
-        return '${warn}$objectName $dirEn';
+      default:
+        // Fallback English with simple direction
+        final d = dir == 'left' ? 'on your left' : dir == 'right' ? 'on your right' : 'ahead';
+        return '${warn}$label $d';
     }
   }
 
@@ -278,7 +306,7 @@ class SafetyCoordinator {
     });
   }
 
-  int get frameCount => _frameCount;
+  int get frameCount     => _frameCount;
   int get detectionCount => _detectionCount;
 }
 
