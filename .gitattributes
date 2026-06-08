@@ -1,1 +1,18 @@
+# Git LFS tracking for large binary model files
+*.gguf filter=lfs diff=lfs merge=lfs -text
 *.onnx filter=lfs diff=lfs merge=lfs -text
+*.bin  filter=lfs diff=lfs merge=lfs -text
+*.mdl  filter=lfs diff=lfs merge=lfs -text
+*.fst  filter=lfs diff=lfs merge=lfs -text
+*.a    filter=lfs diff=lfs merge=lfs -text
+*.png  filter=lfs diff=lfs merge=lfs -text
+
+# Dart / Flutter source — always text, never LFS
+*.dart text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.kt   text eol=lf
+*.cpp  text eol=lf
+*.h    text eol=lf
+*.md   text eol=lf
+*.gradle text eol=lf

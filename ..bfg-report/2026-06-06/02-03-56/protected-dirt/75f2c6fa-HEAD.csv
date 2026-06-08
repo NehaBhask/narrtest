@@ -1,6 +1,0 @@
-d12246275c23d0c899d39569a9d1fbbbf74714f4,MODIFY,regular-file,assets/models/decoder_model.onnx,197998671,
-49fdcd6ec5138ea4f2b1c005b2fbb3146ece0252,MODIFY,regular-file,assets/models/decoder_with_past_model.onnx,193262066,
-411be20ff026a8c1638e9c8a5e6448c7d4217c5e,MODIFY,regular-file,assets/models/encoder_model.onnx,32878337,
-80c5592ef1f4c9ede3e357bbd02eb863358a6a9d,MODIFY,regular-file,assets/models/silero_vad.onnx,2327524,
-33bc2079ab1fb8cd24df4e981dcf6154b52fe337,MODIFY,regular-file,whisper_tiny_onnx/decoder_model.onnx,198003065,
-411be20ff026a8c1638e9c8a5e6448c7d4217c5e,MODIFY,regular-file,whisper_tiny_onnx/encoder_model.onnx,32878337,

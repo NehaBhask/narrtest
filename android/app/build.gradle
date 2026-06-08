@@ -17,7 +17,7 @@ android {
 
     defaultConfig {
         applicationId "com.narrator"
-        minSdk 28         // Android 9.0 — required for posix_spawn in llama.cpp server tools
+        minSdk 26         // Android 8.0 — matches README; posix_spawn only needed for server tools (excluded)
         targetSdk flutter.targetSdkVersion
         versionCode flutter.versionCode
         versionName flutter.versionName
@@ -76,6 +76,7 @@ flutter { source "../.." }
 
 dependencies {
     // OnnxRuntime Mobile for Silero VAD, Whisper-tiny, IndicTrans2
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.17.3'
 
     // Kotlin coroutines
     implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3"
